@@ -5,9 +5,6 @@ import { ApiKey } from './api-key.schema'
 
 export type AccessFootprintDocument = AccessFootprint & Document
 
-// How long a distinct origin is kept after it was last used.
-export const FOOTPRINT_TTL_SECONDS = 180 * 24 * 60 * 60
-
 /**
  * One distinct origin an account has been used from: a channel and an address,
  * with the region the edge placed it in.
@@ -34,6 +31,22 @@ export class AccessFootprint {
   @Prop({ type: String })
   country?: string
 
+  @Prop({ type: String })
+  region?: string
+
+  @Prop({ type: String })
+  regionCode?: string
+
+  @Prop({ type: String })
+  city?: string
+
+  @Prop({ type: String })
+  timezone?: string
+
+  // Autonomous system number of the caller's network.
+  @Prop({ type: Number })
+  asn?: number
+
   // Bounded family label for the caller, for example textbee-js or curl.
   @Prop({ type: String })
   client?: string
@@ -57,9 +70,5 @@ export const AccessFootprintSchema =
 // the same origin twice, and the recorder can tell an insert from a refresh.
 AccessFootprintSchema.index({ user: 1, channel: 1, ip: 1 }, { unique: true })
 
-// Retention, and the only index the reach report needs: it reads a window of
-// lastSeenAt. A TTL index must stand alone, so this cannot be compounded.
-AccessFootprintSchema.index(
-  { lastSeenAt: 1 },
-  { expireAfterSeconds: FOOTPRINT_TTL_SECONDS },
-)
+// The reach report reads a window of lastSeenAt.
+AccessFootprintSchema.index({ lastSeenAt: 1 })

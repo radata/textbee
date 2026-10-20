@@ -1,5 +1,7 @@
 import { Test, TestingModule } from '@nestjs/testing'
 import { getModelToken } from '@nestjs/mongoose'
+import { createHmac } from 'crypto'
+import { errors } from '@polar-sh/sdk/2026-10'
 import { Types } from 'mongoose'
 import { BillingService } from './billing.service'
 import { Plan } from './schemas/plan.schema'
@@ -12,145 +14,6 @@ import { BillingNotificationsService } from './billing-notifications.service'
 import { BillingNotificationType } from './schemas/billing-notification.schema'
 import { UsersService } from '../users/users.service'
 import { AnalyticsService } from '../analytics/analytics.service'
-
-describe('BillingService - cancellation handling', () => {
-  let service: BillingService
-
-  // 24-hex string so `new Types.ObjectId(userId)` succeeds.
-  const userId = '507f1f77bcf86cd799439011'
-  const proPlan = { _id: 'plan_pro', name: 'pro' }
-  const polarProductId = 'prod_pro_monthly'
-
-  const mockPlanModel = {
-    findOne: jest.fn(),
-  }
-  const mockSubscriptionModel = {
-    updateOne: jest.fn(),
-  }
-  const emptyModel = {}
-  const mockBillingNotifications = {}
-  const mockUsersService = { markMilestone: jest.fn() }
-  const mockAnalyticsService = {
-    userRegistered: jest.fn(),
-    checkoutStarted: jest.fn(),
-    purchase: jest.fn(),
-  }
-
-  beforeEach(async () => {
-    const module: TestingModule = await Test.createTestingModule({
-      providers: [
-        BillingService,
-        { provide: getModelToken(Plan.name), useValue: mockPlanModel },
-        {
-          provide: getModelToken(Subscription.name),
-          useValue: mockSubscriptionModel,
-        },
-        { provide: getModelToken(User.name), useValue: emptyModel },
-        { provide: getModelToken(SMS.name), useValue: emptyModel },
-        {
-          provide: getModelToken(PolarWebhookPayload.name),
-          useValue: emptyModel,
-        },
-        {
-          provide: getModelToken(CheckoutSession.name),
-          useValue: emptyModel,
-        },
-        {
-          provide: BillingNotificationsService,
-          useValue: mockBillingNotifications,
-        },
-        { provide: UsersService, useValue: mockUsersService },
-        { provide: AnalyticsService, useValue: mockAnalyticsService },
-      ],
-    }).compile()
-
-    service = module.get<BillingService>(BillingService)
-
-    jest.clearAllMocks()
-    mockUsersService.markMilestone.mockResolvedValue(false)
-    mockPlanModel.findOne.mockResolvedValue(proPlan)
-    mockSubscriptionModel.updateOne.mockResolvedValue({ modifiedCount: 1 })
-  })
-
-  describe('cancelSubscription', () => {
-    it('records the scheduled cancellation WITHOUT downgrading (keeps the plan active)', async () => {
-      const currentPeriodEnd = new Date('2026-07-17T00:00:00.000Z')
-
-      await service.cancelSubscription({
-        userId,
-        polarProductId,
-        cancelAtPeriodEnd: true,
-        currentPeriodEnd,
-        status: 'active',
-      })
-
-      expect(mockSubscriptionModel.updateOne).toHaveBeenCalledTimes(1)
-      const [filter, update] = mockSubscriptionModel.updateOne.mock.calls[0]
-
-      // Filter targets the user's active subscription for this plan.
-      expect(filter).toEqual({
-        user: expect.any(Types.ObjectId),
-        plan: proPlan._id,
-        isActive: true,
-      })
-
-      // The fix: the cancellation is recorded with the real period end, and
-      // the subscription stays active. It must NOT flip isActive to false.
-      expect(update).toEqual({
-        cancelAtPeriodEnd: true,
-        currentPeriodEnd,
-        subscriptionEndDate: currentPeriodEnd,
-        status: 'active',
-      })
-      expect(update).not.toHaveProperty('isActive')
-    })
-
-    it('defaults cancelAtPeriodEnd to true and omits period fields when not provided', async () => {
-      await service.cancelSubscription({ userId, polarProductId })
-
-      const [, update] = mockSubscriptionModel.updateOne.mock.calls[0]
-      expect(update).toEqual({ cancelAtPeriodEnd: true })
-      expect(update).not.toHaveProperty('currentPeriodEnd')
-      expect(update).not.toHaveProperty('subscriptionEndDate')
-      expect(update).not.toHaveProperty('isActive')
-    })
-
-    it('throws when no plan matches the Polar product id', async () => {
-      mockPlanModel.findOne.mockResolvedValue(null)
-
-      await expect(
-        service.cancelSubscription({ userId, polarProductId: 'unknown' }),
-      ).rejects.toThrow('No plan found for product ID: unknown')
-      expect(mockSubscriptionModel.updateOne).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('revokeSubscription', () => {
-    it('performs the real downgrade by deactivating the subscription', async () => {
-      await service.revokeSubscription({ userId, polarProductId })
-
-      expect(mockSubscriptionModel.updateOne).toHaveBeenCalledTimes(1)
-      const [filter, update] = mockSubscriptionModel.updateOne.mock.calls[0]
-
-      expect(filter).toEqual({
-        user: expect.any(Types.ObjectId),
-        plan: proPlan._id,
-        isActive: true,
-      })
-      expect(update.isActive).toBe(false)
-      expect(update.subscriptionEndDate).toBeInstanceOf(Date)
-    })
-
-    it('throws when no plan matches the Polar product id', async () => {
-      mockPlanModel.findOne.mockResolvedValue(null)
-
-      await expect(
-        service.revokeSubscription({ userId, polarProductId: 'unknown' }),
-      ).rejects.toThrow('No plan found for product ID: unknown')
-      expect(mockSubscriptionModel.updateOne).not.toHaveBeenCalled()
-    })
-  })
-})
 
 // Pins apart three failures that used to share one misleading message.
 describe('BillingService - checkout guards', () => {
@@ -532,7 +395,8 @@ describe('BillingService - canPerformAction account checks', () => {
       expect(mockBillingNotifications.notifyOnce).toHaveBeenCalledWith(
         expect.objectContaining({
           type: BillingNotificationType.MONTHLY_LIMIT_REACHED,
-          sendEmail: true,
+          emailKey: 'U2',
+          recordHit: true,
         }),
       )
     })
@@ -545,6 +409,18 @@ describe('BillingService - canPerformAction account checks', () => {
       })
     })
 
+    it('still refuses an over-limit send when the notice fails', async () => {
+      mockBillingNotifications.notifyOnce.mockRejectedValue(new Error('db down'))
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+      })
+      expect(console.error).toHaveBeenCalledWith(
+        'canPerformAction: failed to record a limit notice',
+        expect.objectContaining({ error: 'db down' }),
+      )
+    })
+
     it('rejects the receive when RECEIVE_SMS_OVER_LIMIT is reject', async () => {
       process.env.RECEIVE_SMS_OVER_LIMIT = 'reject'
 
@@ -553,14 +429,14 @@ describe('BillingService - canPerformAction account checks', () => {
       })
     })
 
-    it('tells the notice whether receives over the limit are stored', async () => {
+    it('still notifies when receives over the limit are rejected', async () => {
       process.env.RECEIVE_SMS_OVER_LIMIT = 'reject'
 
       await expect(service.canPerformAction(userId, 'receive_sms', 1)).rejects.toMatchObject({
         status: 429,
       })
       expect(mockBillingNotifications.notifyOnce).toHaveBeenCalledWith(
-        expect.objectContaining({ meta: expect.objectContaining({ receivesStored: false }) }),
+        expect.objectContaining({ meta: expect.objectContaining({ limitTripped: 'monthly' }) }),
       )
     })
 
@@ -709,9 +585,9 @@ describe('BillingService - canPerformAction account checks', () => {
       await expect(service.canPerformAction(userId, 'send_sms', 1)).resolves.toEqual({
         overLimit: false,
       })
-      expect(noticeOf(BillingNotificationType.MONTHLY_LIMIT_APPROACHING)?.meta).toEqual({
-        processedSmsLastMonth: 4000,
-        monthlyLimit: 5000,
+      expect(noticeOf(BillingNotificationType.MONTHLY_LIMIT_APPROACHING)).toMatchObject({
+        meta: { processedSmsLastMonth: 4000, monthlyLimit: 5000, planName: 'pro' },
+        emailKey: 'U1_paid',
       })
     })
 
@@ -747,9 +623,9 @@ describe('BillingService - canPerformAction account checks', () => {
 
       await service.canPerformAction(userId, 'send_sms', 1)
 
-      expect(noticeOf(BillingNotificationType.DAILY_LIMIT_APPROACHING)?.meta).toEqual({
-        processedSmsToday: 40,
-        dailyLimit: 50,
+      expect(noticeOf(BillingNotificationType.DAILY_LIMIT_APPROACHING)).toMatchObject({
+        meta: { processedSmsToday: 40, dailyLimit: 50, planName: 'free' },
+        emailKey: 'U3',
       })
       expect(noticeOf(BillingNotificationType.MONTHLY_LIMIT_APPROACHING)).toBeUndefined()
     })
@@ -762,6 +638,284 @@ describe('BillingService - canPerformAction account checks', () => {
       await expect(service.canPerformAction(userId, 'send_sms', 1)).resolves.toEqual({
         overLimit: false,
       })
+    })
+  })
+
+  describe('limit check order and usage email variants', () => {
+    const plans = {
+      pro: { _id: 'plan_pro', name: 'pro', dailyLimit: -1, monthlyLimit: 5000, bulkSendLimit: -1 },
+      scale: { _id: 'plan_scale', name: 'scale', dailyLimit: -1, monthlyLimit: 25000, bulkSendLimit: -1 },
+      custom: { _id: 'plan_c', name: 'custom-acme', dailyLimit: 1000, monthlyLimit: 10000, bulkSendLimit: 500 },
+    }
+    const onPlan = (plan: any) => {
+      mockSubscriptionModel.findOne.mockResolvedValue({ plan: plan._id })
+      mockPlanModel.findById.mockResolvedValue(plan)
+    }
+    const givenCounts = (today: number, last30Days: number) =>
+      mockSmsModel.countDocuments.mockResolvedValueOnce(today).mockResolvedValueOnce(last30Days)
+    const notices = () => mockBillingNotifications.notifyOnce.mock.calls.map(([n]) => n)
+
+    beforeEach(() => {
+      delete process.env.RECEIVE_SMS_OVER_LIMIT
+      givenUser({ emailVerifiedAt: new Date() })
+    })
+
+    it('reports a batch over the batch limit as U5 and nothing else', async () => {
+      givenCounts(0, 0)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 60)).rejects.toMatchObject({
+        status: 429,
+      })
+
+      expect(notices()).toHaveLength(1)
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.BULK_SMS_LIMIT_REACHED,
+        emailKey: 'U5',
+        recordHit: false,
+        meta: { limitTripped: 'bulk', attempted: 60 },
+      })
+    })
+
+    it('checks the monthly limit before the daily one', async () => {
+      givenCounts(50, 300)
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+      })
+
+      expect(notices()).toHaveLength(1)
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.MONTHLY_LIMIT_REACHED,
+        emailKey: 'U2',
+      })
+    })
+
+    it('reports the daily limit as U4 on the free plan', async () => {
+      givenCounts(50, 120)
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+      })
+
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.DAILY_LIMIT_REACHED,
+        emailKey: 'U4',
+        recordHit: true,
+        meta: { limitTripped: 'daily', processedSmsToday: 50 },
+      })
+    })
+
+    it('reports the batch size version of U5 without a limit hit', async () => {
+      givenCounts(0, 0)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 60)).rejects.toThrow()
+
+      expect(notices()[0]).toMatchObject({ emailKey: 'U5', recordHit: false })
+      expect(notices()[0].meta).not.toHaveProperty('roomWindow')
+    })
+
+    it('counts a batch larger than the room left today as a daily hit and sends U5', async () => {
+      givenCounts(49, 100)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 5)).rejects.toMatchObject({
+        status: 429,
+        response: {
+          message: 'This batch had 5 recipients and your account has 1 message left today. Nothing was sent.',
+        },
+      })
+
+      expect(notices()).toHaveLength(1)
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.DAILY_LIMIT_REACHED,
+        title: 'Your batch did not fit',
+        message: 'This batch had 5 recipients and your account has 1 message left today. Nothing was sent.',
+        emailKey: 'U5',
+        recordHit: true,
+        meta: { roomWindow: 'daily', roomLeft: 1, attempted: 5 },
+      })
+    })
+
+    it('counts a batch larger than the monthly room as a monthly hit', async () => {
+      givenCounts(0, 290)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 20)).rejects.toThrow()
+
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.MONTHLY_LIMIT_REACHED,
+        title: 'Your batch did not fit',
+        message:
+          'This batch had 20 recipients and your account has 10 messages left in its monthly allowance. Nothing was sent.',
+        emailKey: 'U5',
+        recordHit: true,
+        meta: { roomWindow: 'monthly', roomLeft: 10 },
+      })
+    })
+
+    it('uses the window with less room when both are short', async () => {
+      givenCounts(45, 290)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 12)).rejects.toThrow()
+
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.DAILY_LIMIT_REACHED,
+        meta: { roomWindow: 'daily', roomLeft: 5 },
+      })
+    })
+
+    it('reports a reached daily limit as U4 even when the monthly room is also short', async () => {
+      givenCounts(50, 290)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 20)).rejects.toThrow()
+
+      expect(notices()[0]).toMatchObject({ emailKey: 'U4', recordHit: true })
+    })
+
+    it('records the hit and notice but no email for a paid plan whose batch does not fit', async () => {
+      onPlan(plans.pro)
+      givenCounts(10, 5450)
+
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 100)).rejects.toMatchObject({
+        status: 429,
+      })
+
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.MONTHLY_LIMIT_REACHED,
+        title: 'Your batch did not fit',
+        emailKey: null,
+        recordHit: true,
+        meta: { roomWindow: 'monthly', roomLeft: 50 },
+      })
+    })
+
+    it.each([
+      ['pro', 'U2_paid'],
+      ['scale', 'U2_top'],
+    ])('picks the monthly email for %s', async (name, key) => {
+      const plan = plans[name]
+      onPlan(plan)
+      givenCounts(10, Math.floor(plan.monthlyLimit * 1.1))
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+      })
+
+      expect(notices()[0]).toMatchObject({ emailKey: key, meta: { planName: name } })
+    })
+
+    it('sends no daily or batch email to a custom plan', async () => {
+      onPlan(plans.custom)
+      givenCounts(1000, 2000)
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+      })
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.DAILY_LIMIT_REACHED,
+        emailKey: null,
+      })
+
+      jest.clearAllMocks()
+      givenCounts(0, 0)
+      await expect(service.canPerformAction(userId, 'bulk_send_sms', 600)).rejects.toMatchObject({
+        status: 429,
+      })
+      expect(notices()[0]).toMatchObject({
+        type: BillingNotificationType.BULK_SMS_LIMIT_REACHED,
+        emailKey: null,
+      })
+    })
+
+    it('counts today from midnight UTC', async () => {
+      givenCounts(0, 0)
+
+      await service.canPerformAction(userId, 'send_sms', 1)
+
+      const since = mockSmsModel.countDocuments.mock.calls[0][0].createdAt.$gte as Date
+      expect(since.getUTCHours()).toBe(0)
+      expect(since.getUTCMinutes()).toBe(0)
+      expect(Date.now() - since.getTime()).toBeLessThan(24 * 3600 * 1000)
+    })
+  })
+
+  describe('billing period', () => {
+    const signedUp = new Date('2026-01-17T22:15:00.000Z')
+    const proPlan = { _id: 'plan_pro', name: 'pro', dailyLimit: -1, monthlyLimit: 5000, bulkSendLimit: -1 }
+    const monthlySince = () =>
+      mockSmsModel.countDocuments.mock.calls[1][0].createdAt.$gte as Date
+
+    beforeEach(() => {
+      jest.useFakeTimers({ now: new Date('2026-10-04T08:00:00.000Z') })
+      givenUser({ emailVerifiedAt: new Date(), createdAt: signedUp })
+    })
+
+    afterEach(() => jest.useRealTimers())
+
+    it('counts a free account from its last signup anniversary', async () => {
+      await service.canPerformAction(userId, 'send_sms', 1)
+
+      expect(monthlySince().toISOString()).toBe('2026-09-17T22:15:00.000Z')
+    })
+
+    it('counts a paid account from its last subscription anniversary and ignores stored period ends', async () => {
+      mockSubscriptionModel.findOne.mockResolvedValue({
+        plan: proPlan._id,
+        subscriptionStartDate: new Date('2026-06-03T08:00:00.000Z'),
+        currentPeriodEnd: new Date('2026-07-03T08:00:00.000Z'),
+        subscriptionEndDate: new Date('2026-07-03T08:00:00.000Z'),
+      })
+      mockPlanModel.findById.mockResolvedValue(proPlan)
+
+      await service.canPerformAction(userId, 'send_sms', 1)
+
+      expect(monthlySince().toISOString()).toBe('2026-10-03T08:00:00.000Z')
+    })
+
+    it('falls back to the user id time when the signup date is missing', async () => {
+      givenUser({ emailVerifiedAt: new Date(), createdAt: undefined })
+
+      await service.canPerformAction(userId, 'send_sms', 1)
+
+      // 507f1f77... was generated on 2012-10-17T21:13:27Z.
+      expect(monthlySince().toISOString()).toBe('2026-09-17T21:13:27.000Z')
+    })
+
+    it('says when the allowance resets', async () => {
+      mockSmsModel.countDocuments.mockResolvedValueOnce(0).mockResolvedValueOnce(300)
+
+      await expect(service.canPerformAction(userId, 'send_sms', 1)).rejects.toMatchObject({
+        status: 429,
+        response: {
+          monthlyResetAt: new Date('2026-10-17T22:15:00.000Z'),
+          message: expect.stringContaining(
+            'Sending starts again when the allowance resets on 17 October at 22:15 UTC',
+          ),
+        },
+      })
+      expect(mockBillingNotifications.notifyOnce).toHaveBeenCalledWith(
+        expect.objectContaining({
+          meta: expect.objectContaining({
+            monthlyPeriodStart: new Date('2026-09-17T22:15:00.000Z'),
+            monthlyResetAt: new Date('2026-10-17T22:15:00.000Z'),
+          }),
+        }),
+      )
+    })
+
+    it('passes the period to the approaching notice', async () => {
+      mockSmsModel.countDocuments.mockResolvedValueOnce(0).mockResolvedValueOnce(250)
+
+      await service.canPerformAction(userId, 'send_sms', 1)
+
+      expect(mockBillingNotifications.notifyOnce).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: BillingNotificationType.MONTHLY_LIMIT_APPROACHING,
+          message:
+            'Your account has used 251 of its 300 messages for this billing period, counting sent and received. 49 are left. The allowance resets on 17 October at 22:15 UTC.',
+          meta: expect.objectContaining({
+            monthlyPeriodStart: new Date('2026-09-17T22:15:00.000Z'),
+          }),
+        }),
+      )
     })
   })
 })
@@ -779,7 +933,11 @@ describe('BillingService - first payment reporting', () => {
   const proPlan = { _id: 'plan_pro', name: 'pro' }
 
   const mockPlanModel = { findOne: jest.fn() }
-  const mockSubscriptionModel = { updateMany: jest.fn(), updateOne: jest.fn() }
+  const mockSubscriptionModel = {
+    find: jest.fn(),
+    findOneAndUpdate: jest.fn(),
+    updateMany: jest.fn(),
+  }
   const mockUserModel = { findById: jest.fn() }
   const mockUsersService = { markMilestone: jest.fn() }
   const mockAnalyticsService = { purchase: jest.fn(), checkoutStarted: jest.fn() }
@@ -820,13 +978,32 @@ describe('BillingService - first payment reporting', () => {
 
     jest.clearAllMocks()
     mockPlanModel.findOne.mockResolvedValue(proPlan)
+    mockSubscriptionModel.find.mockResolvedValue([])
+    mockSubscriptionModel.findOneAndUpdate.mockResolvedValue({ _id: 'row_1' })
     mockSubscriptionModel.updateMany.mockResolvedValue({ modifiedCount: 0 })
-    mockSubscriptionModel.updateOne.mockResolvedValue({ upsertedCount: 1 })
     mockUserModel.findById.mockResolvedValue({
       _id: userId,
       email: 'ada@example.com',
     })
     mockUsersService.markMilestone.mockResolvedValue(true)
+  })
+
+  it('clears the end cause when the subscription runs again', async () => {
+    await service.switchPlan(activePayment)
+
+    const [filter, update] = mockSubscriptionModel.findOneAndUpdate.mock.calls[0]
+    expect(filter).toMatchObject({ polarSubscriptionId: 'sub_1', plan: proPlan._id, polarEndedAt: null })
+    expect(update.$unset).toEqual({ churnCause: 1 })
+    expect(update.$set.isActive).toBe(true)
+  })
+
+  it.each([
+    ['scheduled to cancel', { cancelAtPeriodEnd: true }],
+    ['past due', { status: 'past_due' }],
+  ])('keeps the end cause while the subscription is %s', async (_l, change) => {
+    await service.switchPlan({ ...activePayment, ...change })
+
+    expect(mockSubscriptionModel.findOneAndUpdate.mock.calls[0][1]).not.toHaveProperty('$unset')
   })
 
   it('reports the sale the first time an account pays', async () => {
@@ -852,12 +1029,10 @@ describe('BillingService - first payment reporting', () => {
     // regardless of whether the subscription row was created or updated.
     mockUsersService.markMilestone.mockResolvedValue(false)
 
-    mockSubscriptionModel.updateOne.mockResolvedValue({ upsertedCount: 0 })
     await service.switchPlan(activePayment)
 
-    // An upgrade creates a second {user, plan} row, which upsertedCount would
-    // have treated as a brand new sale.
-    mockSubscriptionModel.updateOne.mockResolvedValue({ upsertedCount: 1 })
+    // An upgrade creates a second row for the new plan, which a row count
+    // would have treated as a brand new sale.
     await service.switchPlan({ ...activePayment, newPlanName: 'scale' })
 
     expect(mockAnalyticsService.purchase).not.toHaveBeenCalled()
@@ -886,6 +1061,431 @@ describe('BillingService - first payment reporting', () => {
     await expect(service.switchPlan(activePayment)).resolves.toEqual({
       success: true,
       plan: 'pro',
+    })
+  })
+})
+
+describe('BillingService - reads raise no usage notices', () => {
+  it('getCurrentSubscription does not notify at 100% usage', async () => {
+    const notifyOnce = jest.fn()
+    const freePlan = { name: 'free', dailyLimit: 50, monthlyLimit: 300, bulkSendLimit: 50 }
+    const service = new BillingService(
+      { findOne: jest.fn().mockResolvedValue(freePlan) } as any,
+      { findOne: jest.fn(() => ({ populate: jest.fn().mockResolvedValue(null) })) } as any,
+      {} as any,
+      { countDocuments: jest.fn().mockResolvedValue(300) } as any,
+      {} as any,
+      {} as any,
+      { notifyOnce } as any,
+      {} as any,
+      {} as any,
+    )
+
+    const result = await service.getCurrentSubscription({
+      _id: '507f1f77bcf86cd799439011',
+      createdAt: new Date('2020-01-17T22:15:00.000Z'),
+    })
+
+    expect(result.usage.monthlyRemaining).toBe(0)
+    expect(result.usage.monthlyResetAt.getTime()).toBeGreaterThan(Date.now())
+    expect(result.usage.monthlyPeriodStart.getUTCDate()).toBe(17)
+    expect(notifyOnce).not.toHaveBeenCalled()
+  })
+})
+
+describe('BillingService - payment retry state and end cause', () => {
+  const eventAt = new Date('2026-09-20T12:00:00Z')
+  const build = ({ pastDue = null as any, storedPastDue = null as any } = {}) => {
+    const subscriptionModel = {
+      updateMany: jest.fn().mockResolvedValue({}),
+      exists: jest.fn().mockResolvedValue(pastDue),
+    }
+    const payloadModel = { exists: jest.fn().mockResolvedValue(storedPastDue) }
+    const service = new BillingService(
+      {} as any,
+      subscriptionModel as any,
+      {} as any,
+      {} as any,
+      payloadModel as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      {} as any,
+    )
+    return { service, subscriptionModel, payloadModel }
+  }
+  const failedCancel = {
+    polarSubscriptionId: 'sub_1',
+    status: 'canceled',
+    cancelAtPeriodEnd: false,
+    endsAt: new Date('2026-09-20T13:00:00Z'),
+    eventAt,
+  }
+
+  const newer = {
+    polarSubscriptionId: 'sub_1',
+    $or: [{ statusEventAt: null }, { statusEventAt: { $lt: eventAt } }],
+  }
+
+  it('keeps the first retry period start when the provider gives none', async () => {
+    const { service, subscriptionModel } = build()
+
+    await service.syncPastDue({ polarSubscriptionId: 'sub_1', status: 'past_due', eventAt })
+
+    expect(subscriptionModel.updateMany).toHaveBeenNthCalledWith(
+      1,
+      { ...newer, isActive: true, pastDueAt: null },
+      { $set: { pastDueAt: eventAt, statusEventAt: eventAt } },
+    )
+    expect(subscriptionModel.updateMany).toHaveBeenNthCalledWith(
+      2,
+      { ...newer, isActive: true },
+      { $set: { statusEventAt: eventAt } },
+    )
+  })
+
+  it('uses the provider time when present', async () => {
+    const { service, subscriptionModel } = build()
+
+    await service.syncPastDue({
+      polarSubscriptionId: 'sub_1',
+      status: 'past_due',
+      pastDueAt: '2026-09-18T00:00:00Z',
+      eventAt,
+    })
+
+    expect(subscriptionModel.updateMany).toHaveBeenCalledWith(
+      { ...newer, isActive: true },
+      { $set: { pastDueAt: new Date('2026-09-18T00:00:00Z'), statusEventAt: eventAt } },
+    )
+  })
+
+  it('clears the retry period only for an event newer than the last one applied', async () => {
+    const { service, subscriptionModel } = build()
+
+    await service.syncPastDue({ polarSubscriptionId: 'sub_1', status: 'active', eventAt })
+
+    expect(subscriptionModel.updateMany).toHaveBeenCalledWith(newer, {
+      $set: { statusEventAt: eventAt },
+      $unset: { pastDueAt: 1 },
+    })
+  })
+
+  it('ignores other statuses', async () => {
+    const { service, subscriptionModel } = build()
+
+    await service.syncPastDue({ polarSubscriptionId: 'sub_1', status: 'canceled', eventAt })
+
+    expect(subscriptionModel.updateMany).not.toHaveBeenCalled()
+  })
+
+  it('reads an immediate end after a retry period as payment_failed', async () => {
+    const { service } = build({ pastDue: { _id: 's' } })
+
+    await expect(service.churnCause(failedCancel)).resolves.toBe('payment_failed')
+  })
+
+  it('falls back to a stored past_due payload from the last 35 days', async () => {
+    const { service, payloadModel } = build({ storedPastDue: { _id: 'p' } })
+
+    await expect(service.churnCause(failedCancel)).resolves.toBe('payment_failed')
+    const filter = payloadModel.exists.mock.calls[0][0]
+    expect(filter).toMatchObject({
+      'payload.data.id': 'sub_1',
+      'payload.data.status': 'past_due',
+    })
+    expect(eventAt.getTime() - filter.createdAt.$gte.getTime()).toBe(35 * 86400000)
+  })
+
+  it.each([
+    ['a scheduled cancellation', { cancelAtPeriodEnd: true }],
+    ['a status that is still active', { status: 'active' }],
+    ['an end more than 3 hours away', { endsAt: new Date('2026-09-20T15:30:00Z') }],
+    ['no end date', { endsAt: null }],
+  ])('reads %s as customer', async (_label, change) => {
+    const { service } = build({ pastDue: { _id: 's' } })
+
+    await expect(service.churnCause({ ...failedCancel, ...change })).resolves.toBe('customer')
+  })
+
+  it('reads an immediate end without a retry period as customer', async () => {
+    const { service } = build()
+
+    await expect(service.churnCause(failedCancel)).resolves.toBe('customer')
+  })
+})
+
+describe('BillingService - new checkout session', () => {
+  it('restarts the stored session on every new checkout', async () => {
+    const plan = { name: 'pro', polarMonthlyProductId: 'prod_m', polarYearlyProductId: 'prod_y' }
+    const checkoutSessionModel = {
+      findOne: jest.fn().mockResolvedValue(null),
+      updateOne: jest.fn().mockReturnValue({ catch: jest.fn() }),
+    }
+    const service = new BillingService(
+      { findOne: jest.fn().mockResolvedValue(plan) } as any,
+      { findOne: jest.fn(() => ({ populate: jest.fn().mockResolvedValue(null) })) } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      checkoutSessionModel as any,
+      {} as any,
+      {} as any,
+      { checkoutStarted: jest.fn() } as any,
+    )
+    ;(service as any).polarApi = {
+      checkouts: {
+        create: jest.fn().mockResolvedValue({
+          id: 'co_2',
+          url: 'https://pay.test/co_2',
+          expires_at: '2026-09-28T00:00:00Z',
+        }),
+      },
+      discounts: { get: jest.fn() },
+    }
+    delete process.env.POLAR_DEFAULT_DISCOUNT_ID
+
+    await service.getCheckoutUrl({
+      user: { _id: new Types.ObjectId('507f1f77bcf86cd799439011'), email: 'a@example.com' },
+      payload: { planName: 'pro', billingInterval: 'monthly' },
+      req: { ip: '127.0.0.1', headers: {} },
+    })
+
+    expect((service as any).polarApi.checkouts.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        products: ['prod_m', 'prod_y'],
+        external_customer_id: '507f1f77bcf86cd799439011',
+        customer_email: 'a@example.com',
+        customer_ip_address: '127.0.0.1',
+        success_url: expect.stringContaining('checkout-success=1'),
+      }),
+    )
+
+    const [filter, update, options] = checkoutSessionModel.updateOne.mock.calls[0]
+    expect(filter).toEqual({ user: expect.any(Types.ObjectId) })
+    expect(update.$set).toMatchObject({
+      checkoutSessionId: 'co_2',
+      isCompleted: false,
+      isAbandoned: false,
+    })
+    expect(update.$set.sessionStartedAt).toBeInstanceOf(Date)
+    expect(update.$set.expiresAt).toEqual(new Date('2026-09-28T00:00:00Z'))
+    expect(update.$unset).toEqual({ completedAt: 1 })
+    expect(options).toEqual({ upsert: true })
+  })
+})
+
+describe('BillingService - Polar SDK calls', () => {
+  const env = { ...process.env }
+  const userId = new Types.ObjectId('507f1f77bcf86cd799439011')
+
+  const build = ({ plan = null as any, current = null as any } = {}) => {
+    const subscriptionModel = {
+      findOne: jest.fn(() => ({ populate: jest.fn().mockResolvedValue(current) })),
+      updateOne: jest.fn().mockReturnValue({ catch: jest.fn() }),
+    }
+    const checkoutSessionModel = {
+      updateOne: jest.fn().mockReturnValue({ catch: jest.fn() }),
+    }
+    const service = new BillingService(
+      { findOne: jest.fn().mockResolvedValue(plan) } as any,
+      subscriptionModel as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      checkoutSessionModel as any,
+      {} as any,
+      {} as any,
+      {} as any,
+    )
+    return { service, subscriptionModel }
+  }
+
+  afterEach(() => {
+    process.env = env
+    jest.restoreAllMocks()
+  })
+
+  describe('webhook validation', () => {
+    const secret = 'whsec_test_secret'
+
+    const signed = (event: Record<string, any>, key = secret) => {
+      const body = Buffer.from(JSON.stringify(event))
+      const id = 'msg_1'
+      const timestamp = Math.floor(Date.now() / 1000).toString()
+      // The previous SDK signed with the UTF-8 bytes of the whole secret
+      const signature = createHmac('sha256', Buffer.from(key, 'utf8'))
+        .update(`${id}.${timestamp}.${body.toString()}`)
+        .digest('base64')
+      return {
+        body,
+        headers: {
+          'webhook-id': id,
+          'webhook-timestamp': timestamp,
+          'webhook-signature': `v1,${signature}`,
+        },
+      }
+    }
+
+    beforeEach(() => {
+      process.env = { ...env, POLAR_WEBHOOK_SECRET: secret }
+      jest.spyOn(console, 'log').mockImplementation(() => undefined)
+      jest.spyOn(console, 'error').mockImplementation(() => undefined)
+    })
+
+    it('returns the raw event for a valid signature', async () => {
+      const { service } = build()
+      const event = {
+        type: 'subscription.updated',
+        timestamp: '2026-09-29T00:00:00Z',
+        data: { id: 'sub_1', cancel_at_period_end: true },
+      }
+      const { body, headers } = signed(event)
+
+      await expect(service.validatePolarWebhookPayload(body, headers)).resolves.toEqual(event)
+    })
+
+    it('returns null for a signed event type the SDK does not know', async () => {
+      const { service } = build()
+      const { body, headers } = signed({ type: 'something.new', data: {} })
+
+      await expect(service.validatePolarWebhookPayload(body, headers)).resolves.toBeNull()
+    })
+
+    it('rejects a payload signed with another secret', async () => {
+      const { service } = build()
+      const { body, headers } = signed({ type: 'subscription.updated', data: {} }, 'whsec_other')
+
+      await expect(service.validatePolarWebhookPayload(body, headers)).rejects.toThrow(
+        'Invalid webhook payload',
+      )
+    })
+  })
+
+  describe('plan change', () => {
+    const plan = { name: 'pro', polarMonthlyProductId: 'prod_pro_m', polarYearlyProductId: 'prod_pro_y' }
+    const current = {
+      _id: 'local_sub',
+      plan: { name: 'starter' },
+      recurringInterval: 'month',
+      polarSubscriptionId: 'sub_1',
+    }
+    const polarSubscription = {
+      id: 'sub_1',
+      status: 'active',
+      product_id: 'prod_starter_m',
+      customer_id: 'cus_1',
+      cancel_at_period_end: true,
+    }
+    const updated = {
+      ...polarSubscription,
+      product_id: 'prod_pro_m',
+      cancel_at_period_end: false,
+      current_period_start: '2026-09-01T00:00:00Z',
+      current_period_end: '2026-10-01T00:00:00Z',
+      started_at: '2026-08-01T00:00:00Z',
+      created_at: '2026-07-31T00:00:00Z',
+      canceled_at: null,
+      amount: 1499,
+      currency: 'usd',
+      recurring_interval: 'month',
+    }
+
+    it('updates the subscription by id and stores dates as Date values', async () => {
+      const { service } = build({ plan, current })
+      const update = jest.fn().mockResolvedValue(updated)
+      ;(service as any).polarApi = {
+        subscriptions: { get: jest.fn().mockResolvedValue(polarSubscription), update },
+      }
+      const switchPlan = jest.spyOn(service, 'switchPlan').mockResolvedValue({} as any)
+
+      await service.changePlan({
+        user: { _id: userId },
+        payload: { planName: 'pro', billingInterval: 'monthly' },
+      })
+
+      expect((service as any).polarApi.subscriptions.get).toHaveBeenCalledWith('sub_1')
+      expect(update).toHaveBeenNthCalledWith(1, 'sub_1', { cancel_at_period_end: false })
+      expect(update).toHaveBeenNthCalledWith(2, 'sub_1', { product_id: 'prod_pro_m' })
+      expect(switchPlan).toHaveBeenCalledWith({
+        userId: userId.toString(),
+        newPlanPolarProductId: 'prod_pro_m',
+        currentPeriodStart: new Date('2026-09-01T00:00:00Z'),
+        currentPeriodEnd: new Date('2026-10-01T00:00:00Z'),
+        subscriptionStartDate: new Date('2026-08-01T00:00:00Z'),
+        endsAt: undefined,
+        endedAt: undefined,
+        modifiedAt: undefined,
+        status: 'active',
+        amount: 1499,
+        currency: 'usd',
+        recurringInterval: 'month',
+        polarSubscriptionId: 'sub_1',
+        polarCustomerId: 'cus_1',
+        cancelAtPeriodEnd: false,
+      })
+    })
+
+    it('flags a scheduled cancellation on the plan change screen', async () => {
+      const { service } = build({ plan, current })
+      ;(service as any).polarApi = {
+        subscriptions: { get: jest.fn().mockResolvedValue(polarSubscription) },
+      }
+
+      const result: any = await service.getCheckoutUrl({
+        user: { _id: userId },
+        payload: { planName: 'pro', billingInterval: 'monthly' },
+        req: { headers: {} },
+      })
+
+      expect(result.planChange.cancelAtPeriodEnd).toBe(true)
+    })
+
+    it('maps a failed prorated charge to PAYMENT_ISSUE', async () => {
+      jest.spyOn(console, 'error').mockImplementation(() => undefined)
+      const { service } = build({ plan, current })
+      ;(service as any).polarApi = {
+        subscriptions: {
+          get: jest.fn().mockResolvedValue({ ...polarSubscription, cancel_at_period_end: false }),
+          update: jest.fn().mockRejectedValue(new errors.SubscriptionsUpdate402Error(402, {} as any)),
+        },
+      }
+
+      await expect(
+        service.changePlan({
+          user: { _id: userId },
+          payload: { planName: 'pro', billingInterval: 'monthly' },
+        }),
+      ).rejects.toMatchObject({ response: { code: 'PAYMENT_ISSUE' } })
+    })
+
+    it('finds the subscription by external customer id when the stored id fails', async () => {
+      jest.spyOn(console, 'error').mockImplementation(() => undefined)
+      const { service, subscriptionModel } = build({ plan, current })
+      const list = jest.fn().mockResolvedValue({ items: [polarSubscription], pagination: {} })
+      ;(service as any).polarApi = {
+        subscriptions: {
+          get: jest.fn().mockRejectedValue(new Error('not found')),
+          list,
+          update: jest.fn().mockResolvedValue(updated),
+        },
+      }
+      jest.spyOn(service, 'switchPlan').mockResolvedValue({} as any)
+
+      await service.changePlan({
+        user: { _id: userId },
+        payload: { planName: 'pro', billingInterval: 'monthly' },
+      })
+
+      expect(list).toHaveBeenCalledWith({
+        external_customer_id: userId.toString(),
+        active: true,
+        limit: 1,
+      })
+      expect(subscriptionModel.updateOne).toHaveBeenCalledWith(
+        { _id: 'local_sub' },
+        { polarSubscriptionId: 'sub_1', polarCustomerId: 'cus_1' },
+      )
     })
   })
 })

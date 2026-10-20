@@ -109,8 +109,8 @@ def webhook():
 
 export function WebhookDocs() {
   return (
-    <Accordion type='multiple' className='w-full space-y-2 sm:space-y-4'>
-      <AccordionItem value='delivery' className='border rounded-lg'>
+    <Accordion type='multiple' className='w-full space-y-3 sm:space-y-4'>
+      <AccordionItem value='delivery' className='frame border rounded-lg bg-card'>
         <AccordionTrigger className='px-3 sm:px-4 hover:no-underline [&[data-state=open]>div]:bg-muted'>
           <div className='flex items-center gap-2 py-2 -my-2 px-2 rounded-md'>
             <AlertCircle className='h-4 w-4' />
@@ -137,7 +137,7 @@ export function WebhookDocs() {
         </AccordionContent>
       </AccordionItem>
 
-      <AccordionItem value='implementation' className='border rounded-lg'>
+      <AccordionItem value='implementation' className='frame border rounded-lg bg-card'>
         <AccordionTrigger className='px-4 hover:no-underline [&[data-state=open]>div]:bg-muted'>
           <div className='flex items-center gap-2 py-2 -my-2 px-2 rounded-md'>
             <AlertCircle className='h-4 w-4' />
@@ -189,6 +189,12 @@ export function WebhookDocs() {
                   <Code>{JSON.stringify(sms_sent_failed, null, 2)}</Code>
                 </TabsContent>
                 </Tabs>
+                <p className='text-xs text-muted-foreground'>
+                  Any event can also include{' '}
+                  <code>{'"simUsed": { "subscriptionId": 19, "slotIndex": 1 }'}</code>
+                  , the SIM that sent or received the message. It is present
+                  only when the textbee app on the phone reports the SIM.
+                </p>
               </div>
             </TabsContent>
 

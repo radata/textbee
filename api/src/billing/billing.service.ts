@@ -11,14 +11,18 @@ import {
   Subscription,
   SubscriptionDocument,
 } from './schemas/subscription.schema'
-import { Polar } from '@polar-sh/sdk'
+import {
+  createPolar,
+  webhooks,
+  type models,
+  type Polar,
+} from '@polar-sh/sdk/2026-10'
 import { User, UserDocument } from '../users/schemas/user.schema'
 import { UsersService } from '../users/users.service'
 import { AnalyticsService } from '../analytics/analytics.service'
 import { CheckoutResponseDTO, PlanDTO } from './billing.dto'
 import { SMSDocument } from '../gateway/schemas/sms.schema'
 import { SMS } from '../gateway/schemas/sms.schema'
-import { validateEvent } from '@polar-sh/sdk/webhooks'
 import {
   PolarWebhookPayload,
   PolarWebhookPayloadDocument,
@@ -32,12 +36,66 @@ import {
   BillingNotificationType,
 } from './billing-notifications.service'
 import { resolveClientAddress } from '../common/client-address'
+import {
+  BillingPeriod,
+  billingPeriod,
+  dailyWindowStart,
+  periodAnchor,
+} from '../notifications/rules/usage-window'
+import { usageEmailKey } from './usage-emails'
+import {
+  decideSync,
+  ENDED_STATUSES,
+  REPLACED_STATUS,
+} from './polar-subscription-sync'
+import { formatDateTime, pluralize, verifyLink } from '../mail/email-render'
+import {
+  appPublicUrl,
+  billingUrl,
+  emailLinkSecret,
+} from '../mail/email-links'
 
-const PAID_MONTHLY_LIMIT_MULTIPLIER = 1.1
+// Paid plans are allowed a little past their nominal monthly limit before sends
+// are refused. Exported because notification targeting measures usage against
+// the same effective allowance, and two copies of this number would drift.
+export const PAID_MONTHLY_LIMIT_MULTIPLIER = 1.1
+
+/** One Polar subscription state, as a webhook or an API response carries it. */
+export type PolarSubscriptionSync = {
+  userId?: string
+  newPlanName?: string
+  newPlanPolarProductId?: string
+  currentPeriodStart?: Date | null
+  currentPeriodEnd?: Date | null
+  subscriptionStartDate?: Date | null
+  status?: string
+  amount?: number
+  currency?: string
+  recurringInterval?: string
+  polarSubscriptionId?: string
+  polarCustomerId?: string
+  cancelAtPeriodEnd?: boolean
+  /** When a scheduled cancellation takes effect. */
+  endsAt?: Date | null
+  endedAt?: Date | null
+  modifiedAt?: Date | null
+  /** The event was subscription.revoked. */
+  revoked?: boolean
+}
+
+// Update fields left undefined are not written.
+const defined = <T extends Record<string, any>>(fields: T): Partial<T> =>
+  Object.fromEntries(
+    Object.entries(fields).filter(([, value]) => value !== undefined),
+  ) as Partial<T>
+
+// Polar returns timestamps as ISO strings
+export const toDate = (value?: string | null): Date | null | undefined =>
+  value == null ? (value as null | undefined) : new Date(value)
 
 @Injectable()
 export class BillingService {
-  private polarApi
+  private polarApi: Polar
 
   constructor(
     @InjectModel(Plan.name) private planModel: Model<PlanDocument>,
@@ -53,9 +111,9 @@ export class BillingService {
     private readonly usersService: UsersService,
     private readonly analyticsService: AnalyticsService,
   ) {
-    this.polarApi = new Polar({
+    this.polarApi = createPolar({
       accessToken: process.env.POLAR_ACCESS_TOKEN ?? '',
-      server:
+      environment:
         process.env.POLAR_SERVER === 'production' ? 'production' : 'sandbox',
     })
   }
@@ -74,101 +132,75 @@ export class BillingService {
       })
       .populate('plan')
 
-    const processedSmsToday = await this.smsModel.countDocuments({
-      user: user._id,
-      createdAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
-    })
-
-    const processedSmsLastMonth = await this.smsModel.countDocuments({
-      user: user._id,
-      createdAt: {
-        $gte: new Date(new Date().setMonth(new Date().getMonth() - 1)),
-      },
-    })
-
     if (subscription) {
-      const plan = subscription.plan
-      const effectiveLimits = this.getEffectiveLimits(subscription, plan)
-
-      this.notifyApproachingLimits(
-        user._id,
-        { today: processedSmsToday, last30Days: processedSmsLastMonth },
-        effectiveLimits,
-      )
-
       return {
         ...subscription.toObject(),
-        usage: {
-          processedSmsToday,
-          processedSmsLastMonth,
-          dailyLimit: effectiveLimits.dailyLimit,
-          monthlyLimit: effectiveLimits.monthlyLimit,
-          bulkSendLimit: effectiveLimits.bulkSendLimit,
-          deviceLimit: effectiveLimits.deviceLimit,
-          dailyRemaining:
-            effectiveLimits.dailyLimit === -1
-              ? -1
-              : effectiveLimits.dailyLimit - processedSmsToday,
-          monthlyRemaining:
-            effectiveLimits.monthlyLimit === -1
-              ? -1
-              : effectiveLimits.monthlyLimit - processedSmsLastMonth,
-          dailyUsagePercentage:
-            effectiveLimits.dailyLimit === -1
-              ? 0
-              : Math.round(
-                  (processedSmsToday / effectiveLimits.dailyLimit) * 100,
-                ),
-          monthlyUsagePercentage:
-            effectiveLimits.monthlyLimit === -1
-              ? 0
-              : Math.round(
-                  (processedSmsLastMonth / effectiveLimits.monthlyLimit) * 100,
-                ),
-        },
+        usage: await this.usageSummary(user, subscription, subscription.plan),
       }
     }
 
     const plan = await this.planModel.findOne({ name: 'free' })
-    const effectiveLimits = this.getEffectiveLimits(null, plan)
-
-    this.notifyApproachingLimits(
-      user._id,
-      { today: processedSmsToday, last30Days: processedSmsLastMonth },
-      effectiveLimits,
-    )
 
     return {
       plan,
       isActive: true,
-      usage: {
-        processedSmsToday,
-        processedSmsLastMonth,
-        dailyLimit: effectiveLimits.dailyLimit,
-        monthlyLimit: effectiveLimits.monthlyLimit,
-        bulkSendLimit: effectiveLimits.bulkSendLimit,
-        deviceLimit: effectiveLimits.deviceLimit,
-        dailyRemaining:
-          effectiveLimits.dailyLimit === -1
-            ? -1
-            : effectiveLimits.dailyLimit - processedSmsToday,
-        monthlyRemaining:
-          effectiveLimits.monthlyLimit === -1
-            ? -1
-            : effectiveLimits.monthlyLimit - processedSmsLastMonth,
-        dailyUsagePercentage:
-          effectiveLimits.dailyLimit === -1
-            ? 0
-            : Math.round(
-                (processedSmsToday / effectiveLimits.dailyLimit) * 100,
-              ),
-        monthlyUsagePercentage:
-          effectiveLimits.monthlyLimit === -1
-            ? 0
-            : Math.round(
-                (processedSmsLastMonth / effectiveLimits.monthlyLimit) * 100,
-              ),
-      },
+      usage: await this.usageSummary(user, null, plan),
+    }
+  }
+
+  // The monthly allowance is counted over this period. See usage-window.ts.
+  private usagePeriod(
+    user: any,
+    subscription: any,
+    plan: any,
+    now: Date,
+  ): BillingPeriod {
+    const anchor = periodAnchor({
+      signupAt:
+        user?.createdAt ?? new Types.ObjectId(String(user._id)).getTimestamp(),
+      subscription: subscription
+        ? {
+            planName: plan?.name,
+            subscriptionStartDate: subscription.subscriptionStartDate,
+            createdAt: subscription.createdAt,
+          }
+        : null,
+    })
+    return billingPeriod(anchor ?? now, now)
+  }
+
+  private async usageSummary(user: any, subscription: any, plan: any) {
+    const now = new Date()
+    const period = this.usagePeriod(user, subscription, plan, now)
+    const processedSmsToday = await this.smsModel.countDocuments({
+      user: user._id,
+      createdAt: { $gte: dailyWindowStart(now) },
+    })
+    const processedSmsLastMonth = await this.smsModel.countDocuments({
+      user: user._id,
+      createdAt: { $gte: period.start },
+    })
+
+    const { dailyLimit, monthlyLimit, bulkSendLimit, deviceLimit } =
+      this.getEffectiveLimits(subscription, plan)
+    const remaining = (limit: number, used: number) =>
+      limit === -1 ? -1 : limit - used
+    const percent = (limit: number, used: number) =>
+      limit === -1 ? 0 : Math.round((used / limit) * 100)
+
+    return {
+      processedSmsToday,
+      processedSmsLastMonth,
+      monthlyPeriodStart: period.start,
+      monthlyResetAt: period.end,
+      dailyLimit,
+      monthlyLimit,
+      bulkSendLimit,
+      deviceLimit,
+      dailyRemaining: remaining(dailyLimit, processedSmsToday),
+      monthlyRemaining: remaining(monthlyLimit, processedSmsLastMonth),
+      dailyUsagePercentage: percent(dailyLimit, processedSmsToday),
+      monthlyUsagePercentage: percent(monthlyLimit, processedSmsLastMonth),
     }
   }
 
@@ -208,7 +240,7 @@ export class BillingService {
           isUpgrade:
             (planChange.selectedPlan.monthlyPrice ?? 0) >
             (currentPlan.monthlyPrice ?? 0),
-          cancelAtPeriodEnd: !!planChange.polarSubscription.cancelAtPeriodEnd,
+          cancelAtPeriodEnd: !!planChange.polarSubscription.cancel_at_period_end,
         },
       }
     }
@@ -250,14 +282,12 @@ export class BillingService {
       // on who started this checkout.
       const clientAddress = resolveClientAddress(req)
 
-      const checkoutOptions: any = {
-        // productId: selectedPlan.polarProductId, // deprecated
+      const checkoutOptions: models.CheckoutCreate = {
         products: orderedProductIds,
-        successUrl: `${process.env.FRONTEND_URL}/dashboard/account?checkout-success=1&checkout_id={CHECKOUT_ID}`,
-        cancelUrl: `${process.env.FRONTEND_URL}/dashboard/account?checkout-cancel=1&checkout_id={CHECKOUT_ID}`,
-        customerEmail: user.email,
-        customerName: user.name,
-        customerIpAddress: clientAddress.ip,
+        success_url: `${process.env.FRONTEND_URL}/dashboard/account?checkout-success=1&checkout_id={CHECKOUT_ID}`,
+        customer_email: user.email,
+        customer_name: user.name,
+        customer_ip_address: clientAddress.ip,
         metadata: {
           userId: user._id?.toString(),
           ...(user.signupSource && { signupSource: user.signupSource }),
@@ -265,17 +295,15 @@ export class BillingService {
             utmCampaign: user.attribution.first.campaign,
           }),
         },
-        externalCustomerId: user._id?.toString(),
+        external_customer_id: user._id?.toString(),
       }
 
       try {
         let discount = null;
         if (discountId) {
-          discount = await this.polarApi.discounts.get({
-            id: discountId,
-          })
+          discount = await this.polarApi.discounts.get(discountId)
           if (discount) {
-            checkoutOptions.discountId = discount.id
+            checkoutOptions.discount_id = discount.id
           }
         }
       } catch (error) {
@@ -295,13 +323,19 @@ export class BillingService {
             user: user._id,
           },
           {
-            user: user._id,
-            checkoutSessionId: checkout.id,
-            checkoutUrl: checkout.url,
-            planName: payload.planName,
-            billingInterval,
-            expiresAt: new Date(checkout.expiresAt),
-            payload: checkout,
+            $set: {
+              user: user._id,
+              checkoutSessionId: checkout.id,
+              checkoutUrl: checkout.url,
+              planName: payload.planName,
+              billingInterval,
+              expiresAt: new Date(checkout.expires_at),
+              payload: checkout,
+              sessionStartedAt: new Date(),
+              isCompleted: false,
+              isAbandoned: false,
+            },
+            $unset: { completedAt: 1 },
           },
           { upsert: true },
         )
@@ -341,7 +375,7 @@ export class BillingService {
     selectedPlan: PlanDocument
     isPlanChange: boolean
     currentSubscription?: SubscriptionDocument
-    polarSubscription?: any
+    polarSubscription?: models.Subscription
     targetProductId?: string
   }> {
     // a missing plan name is a client bug, not an unpurchasable plan
@@ -408,12 +442,12 @@ export class BillingService {
       return { selectedPlan, isPlanChange: false, currentSubscription }
     }
 
-    let polarSubscription = null
+    let polarSubscription: models.Subscription | null = null
     if (currentSubscription.polarSubscriptionId) {
       try {
-        polarSubscription = await this.polarApi.subscriptions.get({
-          id: currentSubscription.polarSubscriptionId,
-        })
+        polarSubscription = await this.polarApi.subscriptions.get(
+          currentSubscription.polarSubscriptionId,
+        )
       } catch (error) {
         console.error('failed to fetch polar subscription by stored id', error)
       }
@@ -424,11 +458,11 @@ export class BillingService {
     if (!polarSubscription || polarSubscription.status === 'canceled') {
       try {
         const page = await this.polarApi.subscriptions.list({
-          externalCustomerId: user._id.toString(),
+          external_customer_id: user._id.toString(),
           active: true,
           limit: 1,
         })
-        polarSubscription = page?.result?.items?.[0] ?? null
+        polarSubscription = page?.items?.[0] ?? null
 
         if (polarSubscription) {
           this.subscriptionModel
@@ -436,7 +470,7 @@ export class BillingService {
               { _id: currentSubscription._id },
               {
                 polarSubscriptionId: polarSubscription.id,
-                polarCustomerId: polarSubscription.customerId,
+                polarCustomerId: polarSubscription.customer_id,
               },
             )
             .catch((error) => {
@@ -469,7 +503,7 @@ export class BillingService {
     }
 
     // Catches drift between our DB and Polar
-    if (polarSubscription.productId === targetProductId) {
+    if (polarSubscription.product_id === targetProductId) {
       throw new BadRequestException({
         message: `You are already on ${planName} plan, please contact billing@textbee.dev to get a custom plan`,
         code: 'ALREADY_ON_PLAN',
@@ -515,35 +549,36 @@ export class BillingService {
     try {
       // A product update on a subscription scheduled for cancellation is
       // rejected by Polar; changing plans clearly signals intent to stay
-      if (polarSubscription.cancelAtPeriodEnd) {
-        await this.polarApi.subscriptions.update({
-          id: polarSubscription.id,
-          subscriptionUpdate: { cancelAtPeriodEnd: false },
+      if (polarSubscription.cancel_at_period_end) {
+        await this.polarApi.subscriptions.update(polarSubscription.id, {
+          cancel_at_period_end: false,
         })
       }
 
       // prorationBehavior omitted on purpose: use the Polar org default
-      const updated = await this.polarApi.subscriptions.update({
-        id: polarSubscription.id,
-        subscriptionUpdate: { productId: targetProductId },
-      })
+      const updated = await this.polarApi.subscriptions.update(
+        polarSubscription.id,
+        { product_id: targetProductId },
+      )
 
       // Update local state right away so the dashboard reflects the change;
       // the subscription.updated webhook that follows is an idempotent no-op
       await this.switchPlan({
         userId: user._id.toString(),
-        newPlanPolarProductId: updated.productId ?? targetProductId,
-        currentPeriodStart: updated.currentPeriodStart,
-        currentPeriodEnd: updated.currentPeriodEnd,
-        subscriptionStartDate: updated.startedAt ?? updated.createdAt,
-        subscriptionEndDate: updated.canceledAt,
+        newPlanPolarProductId: updated.product_id ?? targetProductId,
+        currentPeriodStart: toDate(updated.current_period_start),
+        currentPeriodEnd: toDate(updated.current_period_end),
+        subscriptionStartDate: toDate(updated.started_at ?? updated.created_at),
+        endsAt: toDate(updated.ends_at),
+        endedAt: toDate(updated.ended_at),
+        modifiedAt: toDate(updated.modified_at),
         status: updated.status,
         amount: updated.amount,
         currency: updated.currency,
-        recurringInterval: updated.recurringInterval,
+        recurringInterval: updated.recurring_interval,
         polarSubscriptionId: updated.id,
-        polarCustomerId: updated.customerId,
-        cancelAtPeriodEnd: updated.cancelAtPeriodEnd,
+        polarCustomerId: updated.customer_id,
+        cancelAtPeriodEnd: updated.cancel_at_period_end,
       })
 
       // An open cached checkout for the old plan must not be reusable anymore
@@ -683,17 +718,26 @@ export class BillingService {
 
   private notifyApproachingLimits(
     userId: Types.ObjectId,
-    used: { today: number; last30Days: number },
+    planName: string,
+    used: { today: number; thisPeriod: number },
     limits: { dailyLimit: number; monthlyLimit: number },
+    period: BillingPeriod,
   ) {
     const notify = (
       type: BillingNotificationType,
       title: string,
       message: string,
-      meta: Record<string, number>,
+      meta: Record<string, any>,
     ) =>
       this.billingNotifications
-        .notifyOnce({ userId, type, title, message, meta, sendEmail: true })
+        .notifyOnce({
+          userId,
+          type,
+          title,
+          message,
+          meta: { ...meta, planName },
+          emailKey: usageEmailKey(type, planName),
+        })
         .catch(() => {})
 
     const { dailyLimit, monthlyLimit } = limits
@@ -707,14 +751,19 @@ export class BillingService {
     }
     if (
       monthlyLimit > 0 &&
-      used.last30Days >= monthlyLimit * 0.8 &&
-      used.last30Days < monthlyLimit
+      used.thisPeriod >= monthlyLimit * 0.8 &&
+      used.thisPeriod < monthlyLimit
     ) {
       notify(
         BillingNotificationType.MONTHLY_LIMIT_APPROACHING,
         "You're close to your monthly message limit",
-        `Your account has used ${used.last30Days} of its ${monthlyLimit} messages for the last 30 days, counting sent and received. ${monthlyLimit - used.last30Days} are left.`,
-        { processedSmsLastMonth: used.last30Days, monthlyLimit },
+        `Your account has used ${used.thisPeriod} of its ${monthlyLimit} messages for this billing period, counting sent and received. ${monthlyLimit - used.thisPeriod} are left. The allowance resets on ${formatDateTime(period.end, new Date())}.`,
+        {
+          processedSmsLastMonth: used.thisPeriod,
+          monthlyLimit,
+          monthlyPeriodStart: period.start,
+          monthlyResetAt: period.end,
+        },
       )
     }
   }
@@ -750,6 +799,10 @@ export class BillingService {
     deviceLimit: number,
     activeDeviceCount: number,
   ) {
+    const subscription = await this.subscriptionModel
+      .findOne({ user: new Types.ObjectId(String(userId)), isActive: true })
+      .populate('plan')
+    const planName = (subscription?.plan as Plan | undefined)?.name ?? 'free'
     await this.billingNotifications.notifyOnce({
       userId,
       type: BillingNotificationType.DEVICE_LIMIT_REACHED,
@@ -758,106 +811,389 @@ export class BillingService {
       meta: {
         deviceLimit,
         activeDeviceCount,
+        planName,
       },
-      sendEmail: true,
+      emailKey: usageEmailKey(
+        BillingNotificationType.DEVICE_LIMIT_REACHED,
+        planName,
+      ),
     })
   }
 
-  async switchPlan({
-    userId,
-    newPlanName,
-    newPlanPolarProductId,
-    currentPeriodStart,
-    currentPeriodEnd,
-    subscriptionStartDate,
-    subscriptionEndDate,
-    status,
-    amount,
-    currency,
-    recurringInterval,
-    polarSubscriptionId,
-    polarCustomerId,
-    cancelAtPeriodEnd,
-  }: {
-    userId: string
-    newPlanName?: string
-    newPlanPolarProductId?: string
-    createdAt?: Date
-    currentPeriodStart?: Date
-    currentPeriodEnd?: Date
-    subscriptionStartDate?: Date
-    subscriptionEndDate?: Date
-    status?: string
-    amount?: number
-    currency?: string
-    recurringInterval?: string
-    polarSubscriptionId?: string
-    polarCustomerId?: string
-    cancelAtPeriodEnd?: boolean
-  }) {
-    console.log(`Switching plan for user: ${userId}`)
+  /**
+   * Applies one Polar subscription state to the local rows. Rows are keyed by
+   * the Polar subscription id and plan: a plan change keeps the old plan's row
+   * as history, and a new purchase gets a row of its own. Which events apply,
+   * and when a plan set by hand survives, is decided in
+   * polar-subscription-sync.ts.
+   */
+  async switchPlan(input: PolarSubscriptionSync) {
+    const { polarSubscriptionId } = input
+    const now = new Date()
+    const rows = polarSubscriptionId
+      ? await this.subscriptionModel.find({ polarSubscriptionId })
+      : []
+    const userId = input.userId || (rows[0] ? String(rows[0].user) : undefined)
+    if (!userId || !Types.ObjectId.isValid(userId)) {
+      throw new Error(`No user for Polar subscription ${polarSubscriptionId}`)
+    }
+    const user = new Types.ObjectId(userId)
+    const plan = await this.planFor(input.newPlanPolarProductId, input.newPlanName)
 
-    // Convert userId to ObjectId
-    const userObjectId = new Types.ObjectId(userId)
+    const decision = decideSync({
+      snapshot: {
+        productId: input.newPlanPolarProductId,
+        status: input.status,
+        modifiedAt: input.modifiedAt,
+        endedAt: input.endedAt,
+        revoked: input.revoked,
+      },
+      rows,
+      now,
+    })
 
-    let plan: PlanDocument
-    if (newPlanPolarProductId) {
-      plan = await this.planModel.findOne({
-        $or: [
-          { polarMonthlyProductId: newPlanPolarProductId },
-          { polarYearlyProductId: newPlanPolarProductId },
-        ],
+    if (decision.action === 'ignore') {
+      console.log(
+        `Ignored a ${decision.reason} event for Polar subscription ${polarSubscriptionId}`,
+      )
+      return { success: true, plan: plan?.name, ignored: decision.reason }
+    }
+
+    if (decision.action === 'end') {
+      await this.endPolarSubscription({
+        user,
+        plan,
+        input,
+        hasRows: rows.length > 0,
+        endedAt: decision.endedAt,
       })
-    } else if (newPlanName) {
-      plan = await this.planModel.findOne({ name: newPlanName })
+      console.log(`Ended Polar subscription ${polarSubscriptionId} for user ${userId}`)
+      return { success: true, plan: plan?.name }
     }
 
     if (!plan) {
       throw new Error('Plan not found')
     }
+    const planId = decision.keepPlan ?? plan._id
 
-    console.log(`Found plan: ${plan.name}`)
-
-    // Deactivate current active subscriptions
-    const result = await this.subscriptionModel.updateMany(
-      { user: userObjectId, plan: { $ne: plan._id }, isActive: true },
-      { isActive: false, subscriptionEndDate: new Date() },
+    // Two live Polar subscriptions on one account: the newest started one wins,
+    // so renewals of the older one cannot flip the plan back and forth.
+    const rivals = polarSubscriptionId
+      ? await this.subscriptionModel.find({
+          user,
+          isActive: true,
+          polarSubscriptionId: { $nin: [null, polarSubscriptionId] },
+          polarEndedAt: null,
+        })
+      : []
+    const started = input.subscriptionStartDate?.getTime() ?? 0
+    const outranked = rivals.some(
+      (row: any) =>
+        !ENDED_STATUSES.has(row.status) &&
+        (row.subscriptionStartDate?.getTime?.() ?? 0) > started,
     )
-    console.log(`Deactivated subscriptions: ${result.modifiedCount}`)
+    if (outranked) {
+      console.warn(
+        `User ${userId} has more than one live Polar subscription; ${polarSubscriptionId} is not the newest`,
+      )
+    }
 
-    // Create or update the new subscription
-    const updateResult = await this.subscriptionModel.updateOne(
-      { user: userObjectId, plan: plan._id },
-      {
-        isActive: true,
-        currentPeriodStart,
-        currentPeriodEnd,
-        subscriptionStartDate,
-        subscriptionEndDate,
-        status,
-        amount,
-        currency,
-        recurringInterval,
+    // A running subscription has no end cause.
+    const running = input.status === 'active' && !input.cancelAtPeriodEnd
+    const update = {
+      $set: defined({
+        user,
+        plan: planId,
+        isActive: !outranked,
+        currentPeriodStart: input.currentPeriodStart,
+        currentPeriodEnd: input.currentPeriodEnd,
+        subscriptionStartDate: input.subscriptionStartDate,
+        subscriptionEndDate: input.cancelAtPeriodEnd
+          ? (input.endsAt ?? input.currentPeriodEnd ?? null)
+          : null,
+        status: input.status,
+        amount: input.amount,
+        currency: input.currency,
+        recurringInterval: input.recurringInterval,
         polarSubscriptionId,
-        polarCustomerId,
-        cancelAtPeriodEnd,
-      },
-      { upsert: true },
+        polarCustomerId: input.polarCustomerId,
+        cancelAtPeriodEnd: input.cancelAtPeriodEnd,
+        polarProductId: input.newPlanPolarProductId,
+      }),
+      // Only moves forward, so a late write can never lower it.
+      ...(input.modifiedAt && { $max: { polarEventAt: input.modifiedAt } }),
+      ...(running && { $unset: { churnCause: 1 } }),
+    }
+    // The decision above read the rows earlier; a webhook handled at the same
+    // time may have ended or advanced the row since. The filter repeats both
+    // checks, so such a write finds no row, collides on the unique index, and
+    // is dropped.
+    const key = polarSubscriptionId
+      ? {
+          polarSubscriptionId,
+          plan: planId,
+          polarEndedAt: null,
+          ...(input.modifiedAt
+            ? {
+                $or: [
+                  { polarEventAt: null },
+                  { polarEventAt: { $lte: input.modifiedAt } },
+                ],
+              }
+            : { polarEventAt: null }),
+        }
+      : { user, plan: planId }
+    const current = await this.upsertSubscription(key, update)
+    if (!current) {
+      console.log(
+        `Dropped a concurrent event for Polar subscription ${polarSubscriptionId}`,
+      )
+      return { success: true, plan: plan.name, ignored: 'stale' as const }
+    }
+
+    // A revoke handled at the same time can end another plan's row of this
+    // subscription while this one was written; the end wins.
+    const linked = polarSubscriptionId
+      ? await this.subscriptionModel.find({ polarSubscriptionId })
+      : []
+    const ended = linked.find((row: any) => row.polarEndedAt)
+    if (ended) {
+      await this.endPolarSubscription({
+        user,
+        plan,
+        input,
+        hasRows: true,
+        endedAt: ended.polarEndedAt,
+      })
+      return { success: true, plan: plan.name, ignored: 'ended' as const }
+    }
+
+    // A plan change of this subscription handled at the same time with a
+    // newer event wins; this row becomes its history.
+    const eventAt = (row: any) => row?.polarEventAt?.getTime?.() ?? -Infinity
+    const newer = linked.some(
+      (row: any) =>
+        String(row._id) !== String(current._id) &&
+        eventAt(row) > eventAt(current),
     )
-    console.log(
-      `Updated or created subscription: ${updateResult.upsertedCount > 0 ? 'Created' : 'Updated'}`,
-    )
+    const replace = {
+      $set: { isActive: false, status: REPLACED_STATUS, subscriptionEndDate: now },
+      $unset: { churnCause: 1 },
+    }
+    if (newer) {
+      // Only while the row still holds this event; a newer one may own it now.
+      await this.subscriptionModel.updateMany(
+        {
+          _id: current._id,
+          user,
+          polarEndedAt: null,
+          polarEventAt: current.polarEventAt ?? null,
+        },
+        replace,
+      )
+      return { success: true, plan: plan.name, ignored: 'stale' as const }
+    }
+    let deactivated = 0
+    if (polarSubscriptionId) {
+      // The other plan rows of this subscription, never one a newer event wrote.
+      const history = {
+        polarSubscriptionId,
+        user,
+        _id: { $ne: current._id },
+        polarEndedAt: null,
+        ...(current.polarEventAt && {
+          $or: [
+            { polarEventAt: null },
+            { polarEventAt: { $lte: current.polarEventAt } },
+          ],
+        }),
+      }
+      const replaced = await this.subscriptionModel.updateMany(
+        { ...history, isActive: true },
+        replace,
+      )
+      // Rows another subscription turned off earlier keep their end date.
+      await this.subscriptionModel.updateMany(
+        {
+          ...history,
+          isActive: false,
+          status: { $nin: [REPLACED_STATUS, ...ENDED_STATUSES] },
+        },
+        { $set: { status: REPLACED_STATUS }, $unset: { churnCause: 1 } },
+      )
+      deactivated += replaced?.modifiedCount ?? 0
+    }
+
+    if (!outranked) {
+      // Rows of this subscription were handled above, by event time.
+      const others = {
+        user,
+        isActive: true,
+        _id: { $ne: current._id },
+        ...(polarSubscriptionId && {
+          polarSubscriptionId: { $ne: polarSubscriptionId },
+        }),
+      }
+      // Rows without a Polar id are replaced. Another Polar subscription keeps
+      // its status: Polar still bills it.
+      const replaced = await this.subscriptionModel.updateMany(
+        { ...others, polarSubscriptionId: null },
+        replace,
+      )
+      const result = await this.subscriptionModel.updateMany(others, {
+        $set: { isActive: false, subscriptionEndDate: now },
+      })
+      deactivated += (replaced?.modifiedCount ?? 0) + (result?.modifiedCount ?? 0)
+    }
+    console.log(`Deactivated subscriptions: ${deactivated}`)
+
+    // Two plan events of this subscription can still pass the checks above at
+    // the same time; the newest event keeps the row.
+    if (polarSubscriptionId) {
+      const live = await this.subscriptionModel.find({
+        polarSubscriptionId,
+        user,
+        isActive: true,
+      })
+      if (live.length > 1) {
+        // Rows without an event time rank last; a tie goes to this event's row.
+        const rank = (row: any) => row?.polarEventAt?.getTime?.() ?? 0
+        const mine = (row: any) => Number(String(row._id) === String(current._id))
+        const [, ...stale] = [...live].sort(
+          (a: any, b: any) => rank(b) - rank(a) || mine(b) - mine(a),
+        )
+        await this.subscriptionModel.updateMany(
+          { _id: { $in: stale.map((row: any) => row._id) } },
+          replace,
+        )
+      }
+    }
 
     await this.reportFirstPayment({
       userId,
       plan: plan.name,
-      status,
-      amount,
-      currency,
+      status: input.status,
+      amount: input.amount,
+      currency: input.currency,
       polarSubscriptionId,
     })
 
     return { success: true, plan: plan.name }
+  }
+
+  private async planFor(polarProductId?: string, planName?: string) {
+    if (polarProductId) {
+      return this.planModel.findOne({
+        $or: [
+          { polarMonthlyProductId: polarProductId },
+          { polarYearlyProductId: polarProductId },
+        ],
+      })
+    }
+    if (planName) return this.planModel.findOne({ name: planName })
+    return null
+  }
+
+  // Concurrent webhooks race the upsert; the unique index turns the loser into an update.
+  private async upsertSubscription(key: Record<string, any>, update: any) {
+    try {
+      return await this.subscriptionModel.findOneAndUpdate(key, update, {
+        upsert: true,
+        new: true,
+      })
+    } catch (error) {
+      const raced =
+        error?.code === 11000 &&
+        error?.keyPattern?.polarSubscriptionId !== undefined
+      if (!raced) throw error
+      return this.subscriptionModel.findOneAndUpdate(key, update, { new: true })
+    }
+  }
+
+  /** Ends every row of a Polar subscription. Ending is final; see decideSync. */
+  private async endPolarSubscription({
+    user,
+    plan,
+    input,
+    hasRows,
+    endedAt,
+  }: {
+    user: Types.ObjectId
+    plan: PlanDocument | null
+    input: PolarSubscriptionSync
+    hasRows: boolean
+    endedAt: Date
+  }) {
+    const { polarSubscriptionId } = input
+    const status =
+      input.status && ENDED_STATUSES.has(input.status) ? input.status : 'canceled'
+    endedAt = new Date(endedAt)
+
+    if (polarSubscriptionId && hasRows) {
+      await this.subscriptionModel.updateMany(
+        { polarSubscriptionId, isActive: true },
+        { $set: { isActive: false, status, subscriptionEndDate: endedAt } },
+      )
+      await this.subscriptionModel.updateMany(
+        { polarSubscriptionId, polarEndedAt: null },
+        { $set: { polarEndedAt: endedAt } },
+      )
+      await this.restoreLiveSubscription(user)
+      return
+    }
+
+    if (!plan) {
+      console.error(
+        `Polar subscription ${polarSubscriptionId} ended on an unknown product ${input.newPlanPolarProductId}`,
+      )
+      return
+    }
+
+    // No row carries this id: a row from before ids were stored, or the end
+    // arrived before the start. Either way the end is recorded, so a late
+    // start event finds it and cannot revive the subscription.
+    const fields = defined({
+      polarSubscriptionId,
+      polarCustomerId: input.polarCustomerId,
+      polarProductId: input.newPlanPolarProductId,
+      isActive: false,
+      status,
+      subscriptionStartDate: input.subscriptionStartDate,
+      subscriptionEndDate: endedAt,
+      polarEndedAt: endedAt,
+      currentPeriodStart: input.currentPeriodStart,
+      currentPeriodEnd: input.currentPeriodEnd,
+      amount: input.amount,
+      currency: input.currency,
+      recurringInterval: input.recurringInterval,
+      cancelAtPeriodEnd: input.cancelAtPeriodEnd,
+    })
+    // Only a row that started with this subscription is taken for it, so the
+    // end of an unrelated old purchase cannot end a live row.
+    const started = input.subscriptionStartDate?.getTime()
+    const legacy = (
+      await this.subscriptionModel.find({
+        user,
+        plan: plan._id,
+        isActive: true,
+        polarSubscriptionId: null,
+        assignedBy: null,
+      })
+    ).find(
+      (row: any) =>
+        started !== undefined &&
+        Math.abs((row.subscriptionStartDate?.getTime?.() ?? NaN) - started) <=
+          2 * 60 * 1000,
+    )
+    if (legacy) {
+      await this.subscriptionModel.updateMany({ _id: legacy._id }, { $set: fields })
+      return
+    }
+    if (!polarSubscriptionId) return
+    await this.upsertSubscription(
+      { polarSubscriptionId, plan: plan._id },
+      { $set: { user, plan: plan._id, ...fields } },
+    )
   }
 
   /**
@@ -910,80 +1246,148 @@ export class BillingService {
     }
   }
 
-  async cancelSubscription({
-    userId,
-    polarProductId,
-    cancelAtPeriodEnd,
-    currentPeriodEnd,
+  /** Stores when the current payment retry period started, and clears it once paid. */
+  async syncPastDue({
+    polarSubscriptionId,
     status,
+    pastDueAt,
+    eventAt,
   }: {
-    userId: string
-    polarProductId?: string
-    cancelAtPeriodEnd?: boolean
-    currentPeriodEnd?: Date
+    polarSubscriptionId?: string
     status?: string
+    pastDueAt?: Date | string
+    eventAt: Date
   }) {
-    const userObjectId = new Types.ObjectId(userId)
-
-    const plan = await this.planModel.findOne({
-      $or: [
-        { polarMonthlyProductId: polarProductId },
-        { polarYearlyProductId: polarProductId },
-      ],
-    })
-
-    if (!plan) {
-      throw new Error(`No plan found for product ID: ${polarProductId}`)
+    if (!polarSubscriptionId) return
+    if (status !== 'past_due' && status !== 'active') return
+    // Events can arrive out of order; only a newer status change is applied.
+    const newer = {
+      polarSubscriptionId,
+      $or: [{ statusEventAt: null }, { statusEventAt: { $lt: eventAt } }],
     }
-
-    // Polar "subscription.canceled" = cancellation SCHEDULED. The subscription
-    // stays active until period end. Record the intent; do NOT downgrade here.
-    // The actual downgrade happens on the "subscription.revoked" event.
-    await this.subscriptionModel.updateOne(
-      { user: userObjectId, plan: plan._id, isActive: true },
-      {
-        cancelAtPeriodEnd: cancelAtPeriodEnd ?? true,
-        ...(currentPeriodEnd && {
-          currentPeriodEnd,
-          subscriptionEndDate: currentPeriodEnd,
-        }),
-        ...(status && { status }),
-      },
+    if (status === 'active') {
+      await this.subscriptionModel.updateMany(newer, {
+        $set: { statusEventAt: eventAt },
+        $unset: { pastDueAt: 1 },
+      })
+      return
+    }
+    if (pastDueAt) {
+      await this.subscriptionModel.updateMany(
+        { ...newer, isActive: true },
+        { $set: { pastDueAt: new Date(pastDueAt), statusEventAt: eventAt } },
+      )
+      return
+    }
+    // Keeps the first start of the retry period.
+    await this.subscriptionModel.updateMany(
+      { ...newer, isActive: true, pastDueAt: null },
+      { $set: { pastDueAt: eventAt, statusEventAt: eventAt } },
     )
-
-    console.log(
-      `Recorded scheduled cancellation for user ${userId} on plan ${plan.name} (ends ${currentPeriodEnd ?? 'unknown'})`,
+    await this.subscriptionModel.updateMany(
+      { ...newer, isActive: true },
+      { $set: { statusEventAt: eventAt } },
     )
-    return { success: true, plan: plan.name }
   }
 
-  async revokeSubscription({
-    userId,
-    polarProductId,
+  /** payment_failed when the provider ended the plan right after a failed renewal. */
+  async churnCause({
+    polarSubscriptionId,
+    status,
+    cancelAtPeriodEnd,
+    endsAt,
+    eventAt,
   }: {
-    userId: string
-    polarProductId?: string
-  }) {
-    const userObjectId = new Types.ObjectId(userId)
+    polarSubscriptionId?: string
+    status?: string
+    cancelAtPeriodEnd?: boolean
+    endsAt?: Date | string | null
+    eventAt: Date
+  }): Promise<'customer' | 'payment_failed'> {
+    const ends = endsAt ? new Date(endsAt).getTime() : NaN
+    const endsNow =
+      status === 'canceled' &&
+      cancelAtPeriodEnd === false &&
+      Math.abs(ends - eventAt.getTime()) <= 3 * 60 * 60 * 1000
+    if (!endsNow || !polarSubscriptionId) return 'customer'
 
-    const plan = await this.planModel.findOne({
-      $or: [
-        { polarMonthlyProductId: polarProductId },
-        { polarYearlyProductId: polarProductId },
-      ],
+    const pastDue = await this.subscriptionModel.exists({
+      polarSubscriptionId,
+      pastDueAt: { $ne: null },
     })
+    if (pastDue) return 'payment_failed'
 
-    if (!plan) {
-      throw new Error(`No plan found for product ID: ${polarProductId}`)
-    }
+    const recentPastDue = await this.polarWebhookPayloadModel.exists({
+      'payload.data.id': polarSubscriptionId,
+      'payload.data.status': 'past_due',
+      createdAt: { $gte: new Date(eventAt.getTime() - 35 * 24 * 60 * 60 * 1000) },
+    })
+    return recentPastDue ? 'payment_failed' : 'customer'
+  }
 
-    await this.subscriptionModel.updateOne(
-      { user: userObjectId, plan: plan._id, isActive: true },
-      { isActive: false, subscriptionEndDate: new Date() },
+  /**
+   * Records why a Polar subscription is ending, on its current row only. Rows
+   * a plan change left behind keep no cause, so the ended-plan emails that
+   * read it go out once.
+   */
+  async recordChurnCause({
+    polarSubscriptionId,
+    churnCause,
+  }: {
+    polarSubscriptionId?: string
+    churnCause?: 'customer' | 'payment_failed'
+  }) {
+    if (!polarSubscriptionId || !churnCause) return
+    const rows = await this.subscriptionModel.find({ polarSubscriptionId })
+    const current = rows.filter(
+      (row: any) =>
+        row.isActive ||
+        (row.polarEndedAt &&
+          row.subscriptionEndDate?.getTime?.() === row.polarEndedAt.getTime()),
     )
+    if (!current.length) return
+    await this.subscriptionModel.updateMany(
+      { _id: { $in: current.map((row: any) => row._id) } },
+      { $set: { churnCause } },
+    )
+  }
 
-    console.log(`Revoked subscription for user ${userId} on plan ${plan.name}`)
-    return { success: true, plan: plan.name }
+  /**
+   * When an account's active row ended while another Polar subscription it
+   * pays for is still live, that one takes over at once rather than at its
+   * next renewal.
+   */
+  private async restoreLiveSubscription(user: Types.ObjectId) {
+    const active = await this.subscriptionModel.find({ user, isActive: true })
+    if (active.length) return
+    const live = (
+      await this.subscriptionModel.find({
+        user,
+        isActive: false,
+        polarEndedAt: null,
+        polarSubscriptionId: { $nin: [null] },
+      })
+      // Only rows this sync wrote, which carry their product; older history
+      // rows may hold plans set by hand long ago.
+    ).filter(
+      (row: any) =>
+        row.polarProductId &&
+        !ENDED_STATUSES.has(row.status) &&
+        row.status !== REPLACED_STATUS,
+    )
+    if (!live.length) return
+    const at = (value: any) => value?.getTime?.() ?? 0
+    // The newest started subscription, and its newest row (the current plan).
+    live.sort(
+      (a: any, b: any) =>
+        at(b.subscriptionStartDate) - at(a.subscriptionStartDate) ||
+        at(b.polarEventAt) - at(a.polarEventAt) ||
+        at(b.updatedAt) - at(a.updatedAt),
+    )
+    await this.subscriptionModel.updateMany(
+      { _id: live[0]._id },
+      { $set: { isActive: true, subscriptionEndDate: null } },
+    )
   }
 
   async canPerformAction(
@@ -1051,67 +1455,57 @@ export class BillingService {
         // Otherwise, continue with limit checks using effective limits
       }
 
-      let hasReachedLimit = false
-      let message = ''
-
+      const now = new Date()
+      const period = this.usagePeriod(user, subscription, plan, now)
       const processedSmsToday = await this.smsModel.countDocuments({
         user: user._id,
-        createdAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
+        createdAt: { $gte: dailyWindowStart(now) },
       })
       const processedSmsLastMonth = await this.smsModel.countDocuments({
         user: user._id,
-        createdAt: {
-          $gte: new Date(new Date().setMonth(new Date().getMonth() - 1)),
-        },
+        createdAt: { $gte: period.start },
       })
 
-      let dailyExceeded = false
-      let monthlyExceeded = false
-      let bulkExceeded = false
+      const { dailyLimit, monthlyLimit, bulkSendLimit } = effectiveLimits
+      const dailyFinite = dailyLimit !== -1
+      const monthlyFinite = monthlyLimit !== -1
+      // Paid plans may run a little past their nominal monthly limit.
+      const monthlyCeiling =
+        monthlyFinite && plan.name !== 'free'
+          ? Math.floor(monthlyLimit * PAID_MONTHLY_LIMIT_MULTIPLIER)
+          : monthlyLimit
 
-      if (['send_sms', 'receive_sms', 'bulk_send_sms'].includes(action)) {
-        const dailyFinite = effectiveLimits.dailyLimit !== -1
-        const monthlyFinite = effectiveLimits.monthlyLimit !== -1
-
-        // exceeded checks
-        dailyExceeded =
-          dailyFinite && processedSmsToday + value > effectiveLimits.dailyLimit
-        monthlyExceeded =
-          monthlyFinite &&
-          processedSmsLastMonth + value > effectiveLimits.monthlyLimit
-        bulkExceeded =
-          effectiveLimits.bulkSendLimit !== -1 &&
-          value > effectiveLimits.bulkSendLimit
-
-        if (dailyExceeded) {
-          hasReachedLimit = true
-          message = `Your account has used all ${effectiveLimits.dailyLimit} messages your plan allows today. Sent and received messages both count. Sending starts again at midnight, or upgrade your plan to keep sending now.`
-        }
-
-        if (monthlyExceeded) {
-          hasReachedLimit = true
-          message = `Your account has used its ${effectiveLimits.monthlyLimit} messages for the last 30 days. Sent and received messages both count. Sending starts again as older messages pass 30 days, or upgrade your plan to keep sending now.`
-        }
-
-        if (bulkExceeded) {
-          hasReachedLimit = true
-          message = `This batch has ${value} recipients, and your plan allows ${effectiveLimits.bulkSendLimit} per batch. Nothing was sent. Split it into smaller batches or upgrade your plan.`
-        }
+      // Checked in this order: batch size, then the billing period, then today.
+      // A batch larger than the room left in a window counts as a hit on that window.
+      const monthlyRoom = monthlyFinite ? monthlyCeiling - processedSmsLastMonth : Infinity
+      const dailyRoom = dailyFinite ? dailyLimit - processedSmsToday : Infinity
+      let tripped: 'bulk' | 'monthly' | 'daily' | null = null
+      let reached = false
+      if (bulkSendLimit !== -1 && value > bulkSendLimit) {
+        tripped = 'bulk'
+        reached = true
+      } else if (monthlyFinite && monthlyRoom <= 0) {
+        tripped = 'monthly'
+        reached = true
+      } else if (dailyFinite && dailyRoom <= 0) {
+        tripped = 'daily'
+        reached = true
+      } else if (value > Math.min(monthlyRoom, dailyRoom)) {
+        tripped = dailyRoom <= monthlyRoom ? 'daily' : 'monthly'
       }
 
-      if (hasReachedLimit) {
-        if (
-          plan.name !== 'free' &&
-          monthlyExceeded &&
-          !dailyExceeded &&
-          !bulkExceeded &&
-          processedSmsLastMonth + value <=
-            Math.floor(
-              effectiveLimits.monthlyLimit * PAID_MONTHLY_LIMIT_MULTIPLIER,
-            )
-        ) {
-          return { overLimit: false }
-        }
+      if (tripped) {
+        const room = tripped === 'daily' ? dailyRoom : monthlyRoom
+        const roomText = `${pluralize(room, 'message', 'messages')} left ${
+          tripped === 'daily' ? 'today' : 'in its monthly allowance'
+        }`
+        const message = !reached
+          ? `This batch had ${value} recipients and your account has ${roomText}. Nothing was sent.`
+          : {
+              bulk: `This batch has ${value} recipients, and your plan allows ${bulkSendLimit} per batch. Nothing was sent. Split it into smaller batches or upgrade your plan.`,
+              monthly: `Your account has used its ${monthlyLimit} messages for this billing period. Sent and received messages both count. Sending starts again when the allowance resets on ${formatDateTime(period.end, now)}, or upgrade your plan to keep sending now.`,
+              daily: `Your account has used all ${dailyLimit} messages your plan allows today. Sent and received messages both count. Sending starts again at midnight UTC, or upgrade your plan to keep sending now.`,
+            }[tripped]
 
         const storeReceive =
           action === 'receive_sms' && this.receivesOverLimitAllowed()
@@ -1127,51 +1521,61 @@ export class BillingService {
               value,
               message,
               hasReachedLimit: true,
-              dailyLimit: effectiveLimits.dailyLimit,
-              dailyRemaining: effectiveLimits.dailyLimit - processedSmsToday,
-              monthlyRemaining:
-                effectiveLimits.monthlyLimit - processedSmsLastMonth,
-              bulkSendLimit: effectiveLimits.bulkSendLimit,
-              monthlyLimit: effectiveLimits.monthlyLimit,
+              tripped,
+              reached,
+              dailyLimit,
+              dailyRemaining: dailyLimit - processedSmsToday,
+              monthlyRemaining: monthlyLimit - processedSmsLastMonth,
+              bulkSendLimit,
+              monthlyLimit,
             }),
           )
         }
 
-        let type: BillingNotificationType
-        let titleForEmail = ''
-        if (dailyExceeded) {
-          type = BillingNotificationType.DAILY_LIMIT_REACHED
-          titleForEmail = "You've reached today's message limit"
-        } else if (monthlyExceeded) {
-          type = BillingNotificationType.MONTHLY_LIMIT_REACHED
-          titleForEmail = "You've reached your monthly message limit"
-        } else if (bulkExceeded) {
-          type = BillingNotificationType.BULK_SMS_LIMIT_REACHED
-          titleForEmail = 'Your batch was too big for your plan'
-        }
-        if (type) {
-          const notification = this.billingNotifications.notifyOnce({
-            userId: user._id,
-            type,
-            title: titleForEmail || 'Usage limit notice',
-            message,
-            meta: {
-              processedSmsToday,
-              processedSmsLastMonth,
-              attempted: value,
-              dailyLimit: effectiveLimits.dailyLimit,
-              monthlyLimit: effectiveLimits.monthlyLimit,
-              bulkSendLimit: effectiveLimits.bulkSendLimit,
-              receivesStored: this.receivesOverLimitAllowed(),
-            },
-            sendEmail: true,
+        const type = {
+          bulk: BillingNotificationType.BULK_SMS_LIMIT_REACHED,
+          monthly: BillingNotificationType.MONTHLY_LIMIT_REACHED,
+          daily: BillingNotificationType.DAILY_LIMIT_REACHED,
+        }[tripped]
+        const title = !reached
+          ? 'Your batch did not fit'
+          : {
+              bulk: 'Your batch was too big for your plan',
+              monthly: "You've reached your monthly message limit",
+              daily: "You've reached today's message limit",
+            }[tripped]
+        const emailKey = reached
+          ? usageEmailKey(type, plan.name)
+          : usageEmailKey(BillingNotificationType.BULK_SMS_LIMIT_REACHED, plan.name)
+        // A failed notice must never let an over-limit action through.
+        const notification = this.billingNotifications.notifyOnce({
+          userId: user._id,
+          type,
+          title,
+          message,
+          meta: {
+            processedSmsToday,
+            processedSmsLastMonth,
+            attempted: value,
+            dailyLimit,
+            monthlyLimit,
+            bulkSendLimit,
+            planName: plan.name,
+            limitTripped: tripped,
+            monthlyPeriodStart: period.start,
+            monthlyResetAt: period.end,
+            ...(!reached && { roomWindow: tripped, roomLeft: room }),
+          },
+          emailKey,
+          recordHit: tripped !== 'bulk',
+        })
+        const logged = notification.catch((error) => {
+          console.error('canPerformAction: failed to record a limit notice', {
+            userId,
+            error: error?.message ?? error,
           })
-          if (storeReceive) {
-            notification.catch(() => {})
-          } else {
-            await notification
-          }
-        }
+        })
+        if (!storeReceive) await logged
 
         if (storeReceive) {
           return { overLimit: true }
@@ -1181,27 +1585,27 @@ export class BillingService {
           {
             message: message,
             hasReachedLimit: true,
-            dailyLimit: effectiveLimits.dailyLimit,
-            dailyRemaining: effectiveLimits.dailyLimit - processedSmsToday,
-            monthlyRemaining:
-              effectiveLimits.monthlyLimit - processedSmsLastMonth,
-            bulkSendLimit: effectiveLimits.bulkSendLimit,
-            monthlyLimit: effectiveLimits.monthlyLimit,
+            dailyLimit,
+            dailyRemaining: dailyLimit - processedSmsToday,
+            monthlyRemaining: monthlyLimit - processedSmsLastMonth,
+            monthlyResetAt: period.end,
+            bulkSendLimit,
+            monthlyLimit,
           },
           HttpStatus.TOO_MANY_REQUESTS,
         )
       }
 
-      if (['send_sms', 'receive_sms', 'bulk_send_sms'].includes(action)) {
-        this.notifyApproachingLimits(
-          user._id,
-          {
-            today: processedSmsToday + value,
-            last30Days: processedSmsLastMonth + value,
-          },
-          effectiveLimits,
-        )
-      }
+      this.notifyApproachingLimits(
+        user._id,
+        plan.name,
+        {
+          today: processedSmsToday + value,
+          thisPeriod: processedSmsLastMonth + value,
+        },
+        effectiveLimits,
+        period,
+      )
 
       return { overLimit: false }
     } catch (error) {
@@ -1218,6 +1622,7 @@ export class BillingService {
   }
 
   async getUsage(userId: string) {
+    const user = await this.userModel.findById(userId).select('createdAt')
     const subscription = await this.subscriptionModel.findOne({
       user: new Types.ObjectId(userId),
       isActive: true,
@@ -1230,36 +1635,11 @@ export class BillingService {
       plan = await this.planModel.findById(subscription.plan)
     }
 
-    const effectiveLimits = this.getEffectiveLimits(subscription, plan)
-
-    const processedSmsToday = await this.smsModel.countDocuments({
-      user: new Types.ObjectId(userId),
-      createdAt: { $gte: new Date(new Date().setHours(0, 0, 0, 0)) },
-    })
-
-    const processedSmsLastMonth = await this.smsModel.countDocuments({
-      user: new Types.ObjectId(userId),
-      createdAt: {
-        $gte: new Date(new Date().setMonth(new Date().getMonth() - 1)),
-      },
-    })
-
-    return {
-      processedSmsToday,
-      processedSmsLastMonth,
-      dailyLimit: effectiveLimits.dailyLimit,
-      monthlyLimit: effectiveLimits.monthlyLimit,
-      bulkSendLimit: effectiveLimits.bulkSendLimit,
-      deviceLimit: effectiveLimits.deviceLimit,
-      dailyRemaining:
-        effectiveLimits.dailyLimit === -1
-          ? -1
-          : effectiveLimits.dailyLimit - processedSmsToday,
-      monthlyRemaining:
-        effectiveLimits.monthlyLimit === -1
-          ? -1
-          : effectiveLimits.monthlyLimit - processedSmsLastMonth,
-    }
+    return this.usageSummary(
+      user ?? { _id: new Types.ObjectId(userId) },
+      subscription,
+      plan,
+    )
   }
 
   async validatePolarWebhookPayload(payload: any, headers: any) {
@@ -1269,13 +1649,18 @@ export class BillingService {
       'webhook-signature': headers['webhook-signature'] ?? '',
     }
     try {
-      const webhookPayload = validateEvent(
+      const webhookPayload = await webhooks.validateEvent(
         payload,
         webhookHeaders,
-        process.env.POLAR_WEBHOOK_SECRET,
+        process.env.POLAR_WEBHOOK_SECRET ?? '',
       )
       return webhookPayload
     } catch (error) {
+      // Signed but newer than this SDK knows; acknowledge so Polar stops retrying
+      if (error instanceof webhooks.PolarWebhookUnknownTypeError) {
+        console.log('ignoring unknown polar webhook event type', error.eventType)
+        return null
+      }
       console.log('failed to validate polar webhook payload')
       console.error(error)
       throw new Error('Invalid webhook payload')
@@ -1283,12 +1668,12 @@ export class BillingService {
   }
 
   async storePolarWebhookPayload(payload: any) {
-    const userId = payload.data?.metadata?.userId || payload.data?.userId
+    const userId = payload.data?.metadata?.userId || payload.data?.user_id
     const eventType = payload.type
-    const name = payload.data?.customer?.name || payload.data?.customerName
-    const email = payload.data?.customer?.email || payload.data?.customerEmail
-    const productId = payload.data?.product?.id || payload.data?.productId
-    const productName = payload.data?.product?.name || payload.data?.productName
+    const name = payload.data?.customer?.name || payload.data?.customer_name
+    const email = payload.data?.customer?.email || payload.data?.customer_email
+    const productId = payload.data?.product?.id || payload.data?.product_id
+    const productName = payload.data?.product?.name || payload.data?.product_name
 
     await this.polarWebhookPayloadModel.create({
       userId,
@@ -1299,6 +1684,59 @@ export class BillingService {
       productId,
       productName,
     })
+  }
+
+  private linkId(token: unknown, purpose: string): string | null {
+    const secret = emailLinkSecret()
+    if (!secret) return null
+    return verifyLink(secret, token, purpose, Math.floor(Date.now() / 1000))
+  }
+
+  /** Where a signed card update link leads: the customer portal, or the billing page. */
+  async cardUpdateRedirect(token: unknown): Promise<string> {
+    const fallback = billingUrl()
+    const polarSubscriptionId = this.linkId(token, 'card')
+    if (!polarSubscriptionId) return fallback
+    try {
+      const subscription = await this.subscriptionModel.findOne({
+        polarSubscriptionId,
+        polarCustomerId: { $nin: [null, ''] },
+      })
+      if (!subscription?.polarCustomerId) return fallback
+      const session = await this.polarApi.customerSessions.create({
+        customer_id: subscription.polarCustomerId,
+        return_url: fallback,
+      })
+      const url = session?.customer_portal_url
+      return typeof url === 'string' && url.startsWith('https://') ? url : fallback
+    } catch (error) {
+      console.error('failed to open the customer portal from an email link', error?.message)
+      return fallback
+    }
+  }
+
+  /** Where a signed checkout link leads: the open checkout, or a new one for the same plan. */
+  async checkoutResumeRedirect(token: unknown): Promise<string> {
+    const checkoutSessionId = this.linkId(token, 'checkout-resume')
+    if (!checkoutSessionId) return billingUrl()
+    let session: CheckoutSessionDocument | null = null
+    try {
+      session = await this.checkoutSessionModel.findOne({ checkoutSessionId })
+    } catch (error) {
+      console.error('failed to load a checkout from an email link', error?.message)
+    }
+    if (
+      session &&
+      !session.isCompleted &&
+      !session.isAbandoned &&
+      session.expiresAt?.getTime() > Date.now() &&
+      session.checkoutUrl?.startsWith('https://')
+    ) {
+      return session.checkoutUrl
+    }
+    const plan = encodeURIComponent(session?.planName || 'pro')
+    const interval = session?.billingInterval === 'yearly' ? 'yearly' : 'monthly'
+    return `${appPublicUrl()}/checkout/${plan}?billingInterval=${interval}`
   }
 
   /**

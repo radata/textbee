@@ -41,6 +41,7 @@ import {
   SendSMSResponseDTO,
   SMSBatchResponseDTO,
   SMSResponseDTO,
+  SmsPermissionStatusResponseDTO,
   SuccessResponseDTO,
   UpdateSMSStatusDTO,
   HeartbeatInputDTO,
@@ -106,6 +107,24 @@ export class GatewayController {
   @Get('/stats')
   async getStats(@Request() req) {
     const data = await this.gatewayService.getStatsForUser(req.user)
+    return { data }
+  }
+
+  @UseGuards(AuthGuard)
+  @ApiOperation({
+    summary: 'Check whether a missing SMS permission blocks sending',
+    description:
+      'Reads your latest outgoing message. If it failed with error code PERMISSION_DENIED, the textbee app on that phone lacks the SMS permission (or the Phone permission, for a send from a chosen SIM) and every send from it fails until the permission is granted (source failure). Otherwise, if an enabled phone reported the SMS permission off in a heartbeat within the last 7 days, the result also says the permission is needed, before any send is attempted (source heartbeat). The result clears as soon as a later message is sent or the phone reports the permission granted.',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Permission status.',
+    type: SmsPermissionStatusResponseDTO,
+  })
+  @ApiResponse(UNAUTHORIZED_RESPONSE)
+  @Get('/sms-permission-status')
+  async getSmsPermissionStatus(@Request() req) {
+    const data = await this.gatewayService.getSmsPermissionStatus(req.user)
     return { data }
   }
 
@@ -770,7 +789,7 @@ export class GatewayController {
   @ApiOperation({
     summary: 'Get a send batch',
     description:
-      'The batch returned by a send, plus one message per recipient. Poll this to see how a send is progressing.',
+      'The batch returned by a send, plus one message per recipient. The batch status and counts are calculated from the messages, so they follow each status report from the phone. Poll this to see how a send is progressing.',
   })
   @ApiParam(DEVICE_ID_PARAM)
   @ApiParam({

@@ -84,7 +84,7 @@ test.describe('dashboard (mocked API, no real backend)', () => {
         dialog.getByRole('heading', { name: 'Add a device' })
       ).toBeVisible()
       // The prerequisites a key modal never mentioned.
-      await expect(dialog.getByText(/grant SMS permissions/)).toBeVisible()
+      await expect(dialog.getByText(/allow the SMS permission/i)).toBeVisible()
 
       // Key generation is still reachable, just no longer the first thing.
       await expect(
@@ -168,7 +168,7 @@ test.describe('dashboard (mocked API, no real backend)', () => {
       page.getByRole('progressbar', { name: 'Today usage' })
     ).toBeVisible()
     await expect(
-      page.getByRole('progressbar', { name: 'Last 30 days usage' })
+      page.getByRole('progressbar', { name: 'Billing period usage' })
     ).toBeVisible()
     await expect(page.getByText('/ 5,000')).toBeVisible()
     await expect(page.getByText('4,680 remaining')).toBeVisible()

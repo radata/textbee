@@ -33,10 +33,22 @@ export interface GatewayStats {
   totalApiKeyCount?: number
 }
 
+export interface SmsPermissionStatus {
+  needsSmsPermission: boolean | null
+  hoursSinceFailure: number | null
+  deviceId: string | null
+  deviceName: string | null
+  failedAt: string | null
+  // failure: the latest send failed. heartbeat: the phone reports it off.
+  source: 'failure' | 'heartbeat' | null
+}
+
 export interface Device {
   _id: string
   brand?: string
   model?: string
+  // Custom name the user set in the dashboard.
+  name?: string | null
   enabled?: boolean
   // The device the API sends from when a request omits deviceId.
   isDefault?: boolean
@@ -49,6 +61,11 @@ export interface Device {
   // returns. It is deliberately not modelled here yet: surfacing it is a
   // feature, not a fix, and belongs in its own change.
   appVersionCode?: number
+  appStateInfo?: {
+    hasSendSmsPermission?: boolean
+    hasReadPhoneStatePermission?: boolean
+    lastUpdated?: string
+  }
   createdAt?: string
 }
 
@@ -85,7 +102,10 @@ export interface SubscriptionUsage {
   bulkSendLimit?: number
   deviceLimit?: number
   processedSmsToday?: number
+  // Counts the current billing period; the name predates periods.
   processedSmsLastMonth?: number
+  monthlyPeriodStart?: string
+  monthlyResetAt?: string
   dailyRemaining?: number
   monthlyRemaining?: number
   dailyUsagePercentage?: number
@@ -127,7 +147,7 @@ export interface WebhookNotification {
   createdAt?: string
   status: string
   computedStatus?: string
-  deviceData?: { brand?: string; model?: string }
+  deviceData?: { brand?: string; model?: string; name?: string | null }
   smsData?: { _id?: string }
   payload?: unknown
 }
@@ -139,4 +159,53 @@ export interface WebhookSubscription {
   events?: string[]
   isActive?: boolean
   createdAt?: string
+}
+
+// ---------- dashboard notifications ----------
+
+export type NotificationTone =
+  | 'info'
+  | 'success'
+  | 'warning'
+  | 'critical'
+  | 'promo'
+
+export interface NotificationAction {
+  label: string
+  href: string
+  style?: string
+  target?: string
+  trackAs?: string
+}
+
+export interface ServedNotification {
+  id: string
+  key: string
+  kind: 'system' | 'campaign'
+  placement: 'tile' | 'modal'
+  tone: NotificationTone
+  renderer: string
+  rank: number
+  variantId: string
+  title: string
+  body?: string
+  actions: NotificationAction[]
+  dismissible: boolean
+  dismissAfterSeconds?: number
+}
+
+export interface NotificationFeed {
+  // False means this account should render the dashboard's own built-in
+  // messages instead. The engine is then off for it and the list is empty.
+  engineEnabled: boolean
+  settings: { maxTilesAtOnce: number; maxModalsPerLoad: number } | null
+  notifications: ServedNotification[]
+}
+
+export type NotificationEventType = 'impression' | 'click' | 'dismiss'
+
+export interface NotificationEvent {
+  notificationId: string
+  type: NotificationEventType
+  variantId?: string
 }

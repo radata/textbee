@@ -12,6 +12,8 @@ import {
 } from '@/components/ui/select'
 import { formatDeviceName } from '@/lib/utils'
 import StepShell from './step-shell'
+import { SimIdInput } from '../sim-id-input'
+import { SIM_ID_ERROR } from '@/lib/sim-id'
 import type { BulkSendState } from './use-bulk-send'
 
 export default function MapStep({ bulk }: { bulk: BulkSendState }) {
@@ -25,7 +27,8 @@ export default function MapStep({ bulk }: { bulk: BulkSendState }) {
     devices,
     handleRecipientColumnChange,
     plan,
-    availableSims,
+    selectedDevice,
+    simIdInvalid,
     hasFile,
     mapped,
   } = bulk
@@ -91,36 +94,24 @@ export default function MapStep({ bulk }: { bulk: BulkSendState }) {
             </Select>
           </div>
 
-          {availableSims.length > 1 && (
-            <div className='space-y-1.5'>
-              <Label htmlFor='sim-select'>SIM (optional)</Label>
-              <Select
-                value={simSubscriptionId?.toString() ?? ''}
-                onValueChange={(v) =>
-                  setSimSubscriptionId(v ? Number(v) : undefined)
-                }
-              >
-                <SelectTrigger id='sim-select'>
-                  <SelectValue placeholder='Default SIM' />
-                </SelectTrigger>
-                <SelectContent>
-                  {availableSims.map((sim: any) => (
-                    <SelectItem
-                      key={sim.subscriptionId}
-                      value={String(sim.subscriptionId)}
-                    >
-                      {sim.displayName || 'SIM'} ({sim.subscriptionId})
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
+          {/* Full width: half a grid cell squeezes the warning */}
+          {deviceId && (
+            <div className='sm:col-span-2'>
+              <SimIdInput
+                key={deviceId}
+                id='sim-select'
+                value={simSubscriptionId}
+                onChange={setSimSubscriptionId}
+                simInfo={(selectedDevice as any)?.simInfo}
+                error={simIdInvalid ? SIM_ID_ERROR : undefined}
+              />
             </div>
           )}
         </div>
 
         {plan.counts && (
           <div className='flex flex-wrap gap-2 text-xs'>
-            <span className='rounded-full bg-green-100 px-2.5 py-1 font-medium text-green-800 dark:bg-green-900/30 dark:text-green-300'>
+            <span className='rounded-full bg-success/10 px-2.5 py-1 font-medium text-success'>
               {plan.counts.valid.toLocaleString()} will receive a message
             </span>
             {plan.counts.empty > 0 && (
@@ -129,12 +120,12 @@ export default function MapStep({ bulk }: { bulk: BulkSendState }) {
               </span>
             )}
             {plan.counts.invalid > 0 && (
-              <span className='rounded-full bg-amber-100 px-2.5 py-1 font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'>
+              <span className='rounded-full bg-warning/10 px-2.5 py-1 font-medium text-warning'>
                 {plan.counts.invalid} invalid
               </span>
             )}
             {plan.counts.duplicate > 0 && (
-              <span className='rounded-full bg-amber-100 px-2.5 py-1 font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'>
+              <span className='rounded-full bg-warning/10 px-2.5 py-1 font-medium text-warning'>
                 {plan.counts.duplicate} duplicate
               </span>
             )}

@@ -11,15 +11,44 @@ import {
   WebhookNotificationDocument,
 } from './schemas/webhook-notification.schema'
 import axios from 'axios'
+import * as http from 'http'
+import * as https from 'https'
+import { lookup as dnsLookup } from 'dns'
+import { BlockList, isIP, LookupFunction } from 'net'
 import { v4 as uuidv4 } from 'uuid'
 import { Cron } from '@nestjs/schedule'
 import * as crypto from 'crypto'
 import mongoose from 'mongoose'
 import { SMS } from '../gateway/schemas/sms.schema'
+import { resolveSimUsed } from '../gateway/sim-report'
 import { WebhookQueueService } from './queue/webhook-queue.service'
 import { MailService } from '../mail/mail.service'
 import { firstName } from '../mail/first-name'
 import { UsersService } from '../users/users.service'
+
+const blockedAddresses = new BlockList()
+for (const [address, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['224.0.0.0', 3],
+] as const) {
+  blockedAddresses.addSubnet(address, prefix, 'ipv4')
+}
+for (const [address, prefix] of [
+  ['::', 128],
+  ['::1', 128],
+  ['fe80::', 10],
+  ['fec0::', 10],
+  ['fc00::', 7],
+] as const) {
+  blockedAddresses.addSubnet(address, prefix, 'ipv6')
+}
 
 /**
  * Endpoints can carry a token in the query or in userinfo, so the admin summary
@@ -457,9 +486,6 @@ export class WebhookService {
     }
   }
 
-  // Defense-in-depth SSRF check based on hostname/IP literal. Does not perform
-  // DNS resolution; the deny-list also catches the metadata IP commonly used
-  // in cloud SSRF attacks.
   private isPrivateOrLoopbackHost(rawHost: string): boolean {
     if (!rawHost) return true
     const host = rawHost.toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
@@ -472,37 +498,52 @@ export class WebhookService {
     if (host === 'localhost' || host.endsWith('.localhost')) return true
     if (host === 'broadcasthost') return true
 
-    // IPv4 literal
-    const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
-    if (ipv4Match) {
-      const octets = ipv4Match.slice(1).map((o) => parseInt(o, 10))
-      if (octets.some((o) => o < 0 || o > 255)) return true
-      const [a, b] = octets
-      if (a === 0) return true
-      if (a === 10) return true
-      if (a === 127) return true
-      if (a === 169 && b === 254) return true
-      if (a === 172 && b >= 16 && b <= 31) return true
-      if (a === 192 && b === 168) return true
-      // Carrier-grade NAT
-      if (a === 100 && b >= 64 && b <= 127) return true
-      // Multicast and reserved
-      if (a >= 224) return true
-      return false
-    }
-
-    // IPv6 literal (very loose check; only block obvious local ranges)
-    if (host.includes(':')) {
-      if (host === '::1' || host === '::') return true
-      if (host.startsWith('fe80:') || host.startsWith('fe80::')) return true
-      if (host.startsWith('fc') || host.startsWith('fd')) return true
-      // IPv4-mapped IPv6 loopback
-      if (host.includes('::ffff:127.') || host.includes('::ffff:0:127.'))
-        return true
-    }
-
-    return false
+    return this.isBlockedIpAddress(host)
   }
+
+  // Returns false for anything that is not an IP literal.
+  private isBlockedIpAddress(rawIp: string): boolean {
+    const ip = rawIp.toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
+    const family = isIP(ip)
+    if (family === 0) return false
+    return blockedAddresses.check(ip, family === 6 ? 'ipv6' : 'ipv4')
+  }
+
+  // Checks every resolved address at connect time, including redirects.
+  private readonly guardedLookup: LookupFunction = (
+    hostname,
+    options,
+    callback,
+  ) => {
+    const cb = (typeof options === 'function' ? options : callback) as (
+      ...args: any[]
+    ) => void
+    const opts = typeof options === 'object' && options ? options : {}
+
+    dnsLookup(hostname, { ...opts, all: true }, (err, addresses) => {
+      if (err) return cb(err)
+      const list = Array.isArray(addresses) ? addresses : [addresses]
+      if (process.env.WEBHOOK_ALLOW_PRIVATE_HOSTS !== 'true') {
+        for (const a of list) {
+          if (this.isBlockedIpAddress(a.address)) {
+            return cb(
+              new Error('Delivery URL resolves to a disallowed address'),
+            )
+          }
+        }
+      }
+      if (list.length === 0) return cb(new Error('Delivery URL did not resolve'))
+      if (opts.all) return cb(null, list)
+      cb(null, list[0].address, list[0].family)
+    })
+  }
+
+  private readonly deliveryHttpAgent = new http.Agent({
+    lookup: this.guardedLookup,
+  })
+  private readonly deliveryHttpsAgent = new https.Agent({
+    lookup: this.guardedLookup,
+  })
 
   async deliverNotification({ sms, user, event }) {
     if (!Object.values(WebhookEvent).includes(event)) {
@@ -611,6 +652,15 @@ export class WebhookService {
         break
     }
 
+    // Absent until the phone reports it, so older apps keep the old payload
+    const simUsed = resolveSimUsed(
+      sms.simUsed?.subscriptionId,
+      sms.simUsed?.slotIndex,
+    )
+    if (simUsed) {
+      payload.simUsed = simUsed
+    }
+
     const webhookNotification = await this.webhookNotificationModel.create({
       webhookSubscription: subscription._id,
       event,
@@ -675,11 +725,24 @@ export class WebhookService {
     )
 
     try {
+      // IP-literal hosts skip the agent lookup, so re-check them here.
+      this.validateDeliveryUrl(deliveryUrl)
+
       const response = await axios.post(deliveryUrl, webhookNotification.payload, {
         headers: {
           'X-Signature': signature,
         },
         timeout: deliveryTimeoutMs,
+        maxRedirects: 5,
+        // Redirects to IP literals skip the agent lookup, so check each hop here.
+        beforeRedirect: (options: { hostname?: string }) => {
+          if (this.isPrivateOrLoopbackHost(options.hostname ?? '')) {
+            throw new Error('Delivery redirect points to a disallowed host')
+          }
+        },
+        proxy: false,
+        httpAgent: this.deliveryHttpAgent,
+        httpsAgent: this.deliveryHttpsAgent,
       })
 
       httpStatusCode = response.status
@@ -712,10 +775,10 @@ export class WebhookService {
           ? e.response.data.substring(0, 1000)
           : JSON.stringify(e.response.data || {}).substring(0, 1000)
 
-        // 4xx errors are non-retryable, 5xx are retryable
-        if (e.response.status >= 400 && e.response.status < 500) {
+        // 3xx (redirect not followed) and 4xx are non-retryable, 5xx are retryable
+        if (e.response.status < 500) {
           errorType = 'non-retryable'
-        } else if (e.response.status >= 500) {
+        } else {
           errorType = 'retryable'
         }
       } else {
@@ -734,8 +797,8 @@ export class WebhookService {
       if (errorType === 'non-retryable' && webhookNotification.deliveryAttemptCount >= 3) {
         webhookNotification.deliveryAttemptAbortedAt = now
         webhookNotification.nextDeliveryAttemptAt = undefined
-      } else if (errorType === 'retryable' && webhookNotification.deliveryAttemptCount < 10) {
-        // For retryable errors, schedule next attempt
+      } else if (webhookNotification.deliveryAttemptCount < 10) {
+        // Retryable errors, and 4xx before the 3rd attempt, schedule the next attempt
         webhookNotification.nextDeliveryAttemptAt = this.getNextDeliveryAttemptAt(
           webhookNotification.deliveryAttemptCount,
         )

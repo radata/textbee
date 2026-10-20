@@ -1,5 +1,6 @@
 import { HttpException, HttpStatus, Injectable } from '@nestjs/common'
 import { UsersService } from '../users/users.service'
+import { UserRollupService } from '../users/user-rollup.service'
 import { sanitizeAttribution } from '../users/attribution'
 import { AnalyticsService } from '../analytics/analytics.service'
 import { JwtService } from '@nestjs/jwt'
@@ -20,9 +21,10 @@ import {
   PasswordResetDocument,
 } from './schemas/password-reset.schema'
 import { MailService } from '../mail/mail.service'
-import { firstName } from '../mail/first-name'
 import { TurnstileService } from '../common/turnstile.service'
 import { escapeRegExp } from '../common/escape-regexp'
+import { pickLocation } from '../common/client-address'
+import { RequestContext } from '../common/request-context'
 import { RequestResetPasswordInputDTO, ResetPasswordInputDTO } from './auth.dto'
 import { AccessFootprintService } from './access-footprint.service'
 import {
@@ -48,6 +50,7 @@ export const withoutPassword = (user: UserDocument) => {
 export class AuthService {
   constructor(
     private usersService: UsersService,
+    private readonly userRollup: UserRollupService,
     private jwtService: JwtService,
     @InjectModel(ApiKey.name) private apiKeyModel: Model<ApiKeyDocument>,
     @InjectModel(ApiKeyTombstone.name)
@@ -62,10 +65,7 @@ export class AuthService {
     private readonly analyticsService: AnalyticsService,
   ) {}
 
-  async login(
-    userData: any,
-    requestContext?: { ip?: string; userAgent?: string; country?: string },
-  ) {
+  async login(userData: any, requestContext?: RequestContext) {
     await this.turnstileService.verify(userData.turnstileToken)
 
     const user = await this.usersService.findOneWithPassword({
@@ -133,12 +133,7 @@ export class AuthService {
 
   async loginWithGoogle(
     idToken: string,
-    signupContext?: {
-      attribution?: unknown
-      ip?: string
-      userAgent?: string
-      country?: string
-    },
+    signupContext?: RequestContext & { attribution?: unknown },
   ) {
     const response = await axios.get(
       `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(
@@ -162,6 +157,7 @@ export class AuthService {
         attribution: sanitizeAttribution(signupContext?.attribution),
         userAgent: signupContext?.userAgent,
         country: signupContext?.country,
+        location: pickLocation(signupContext),
       })
     }
 
@@ -188,10 +184,7 @@ export class AuthService {
     await user.save()
 
     if (isNewUser) {
-      this.analyticsService.userRegistered(user as any, {
-        ip: signupContext?.ip,
-        userAgent: signupContext?.userAgent,
-      })
+      this.analyticsService.userRegistered(user as any, signupContext)
     }
 
     const payload = { email: user.email, sub: user._id }
@@ -202,10 +195,7 @@ export class AuthService {
     }
   }
 
-  async register(
-    userData: any,
-    requestContext?: { ip?: string; userAgent?: string; country?: string },
-  ) {
+  async register(userData: any, requestContext?: RequestContext) {
     await this.turnstileService.verify(userData.turnstileToken)
 
     const existingUser = await this.usersService.findOne({
@@ -234,6 +224,7 @@ export class AuthService {
       attribution: sanitizeAttribution(userData.attribution),
       userAgent: requestContext?.userAgent,
       country: requestContext?.country,
+      location: pickLocation(requestContext),
     })
 
     user.lastLoginAt = new Date()
@@ -301,17 +292,14 @@ export class AuthService {
     })
     await passwordReset.save()
 
-    const resetLink = `${process.env.FRONTEND_URL || 'https://textbee.dev'}/reset-password?email=${encodeURIComponent(user.email)}&otp=${otp}`
+    const resetUrl = `${process.env.FRONTEND_URL || 'https://textbee.dev'}/reset-password?email=${encodeURIComponent(user.email)}&otp=${otp}`
 
-    await this.mailService.sendEmailFromTemplate({
-      to: user.email,
-      subject: 'textbee.dev - Password Reset',
-      template: 'password-reset-request',
-      context: { name: firstName(user.name), resetLink, otp },
-    }, {
+    await this.mailService.sendTemplated({
+      key: 'T2',
       userId: user._id,
-      category: 'auth',
-      redactContextKeys: ['otp', 'resetLink'],
+      to: user.email,
+      vars: { resetUrl, otp, linkTtl: '20 minutes' },
+      redactVars: ['resetUrl', 'otp'],
     })
 
     return acceptedResponse
@@ -373,12 +361,11 @@ export class AuthService {
     passwordReset.expiresAt = new Date(Date.now())
     await passwordReset.save()
 
-    this.mailService.sendEmailFromTemplate({
-      to: user.email,
-      subject: 'textbee.dev - Password Reset',
-      template: 'password-reset-success',
-      context: { name: firstName(user.name) },
-    }, { userId: user._id, category: 'auth' })
+    this.mailService
+      .sendTemplated({ key: 'T3', userId: user._id, to: user.email })
+      .catch((e) => {
+        console.log('Failed to send password changed email', e?.message)
+      })
 
     return { message: 'Password reset successfully' }
   }
@@ -415,11 +402,12 @@ export class AuthService {
   }
 
   async sendEmailVerificationEmail(user: UserDocument) {
-    // Check if user has requested email verification more than 5 times in the last 24 hours
+    // Reminder links do not count toward the resend cap.
     const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000)
     const verificationCount = await this.emailVerificationModel.countDocuments({
       user: user._id,
       createdAt: { $gte: twentyFourHoursAgo },
+      source: { $ne: 'reminder' },
     })
 
     if (verificationCount >= 5) {
@@ -432,35 +420,38 @@ export class AuthService {
       )
     }
 
-    const verificationCode = uuidv4()
-    const expiresAt = new Date(Date.now() + 20 * 60 * 1000) // 20 minutes
+    const verificationUrl = await this.mintEmailVerificationLink(user)
 
-    const hashedVerificationCode = await bcrypt.hash(verificationCode, 10)
-
-    const emailVerification = new this.emailVerificationModel({
-      user: user._id,
-      verificationCode: hashedVerificationCode,
-      expiresAt,
-    })
-    await emailVerification.save()
-
-    const verificationLink = `${process.env.FRONTEND_URL || 'https://textbee.dev'}/verify-email?userId=${user._id}&verificationCode=${verificationCode}`
-
-    await this.mailService.sendEmailFromTemplate({
-      to: user.email,
-      subject: 'textbee.dev - Verify Email',
-      template: 'verify-email',
-      context: {
-        name: firstName(user.name),
-        verificationLink,
-      },
-    }, {
+    await this.mailService.sendTemplated({
+      key: 'T1',
       userId: user._id,
-      category: 'auth',
-      redactContextKeys: ['verificationLink'],
+      to: user.email,
+      vars: { verificationUrl, linkTtl: '20 minutes' },
+      redactVars: ['verificationUrl'],
     })
 
     return { message: 'Email verification email sent' }
+  }
+
+  /** Stores a new hashed verification code and returns its link. */
+  async mintEmailVerificationLink(
+    user: Pick<UserDocument, '_id'>,
+    {
+      lifetimeMs = 20 * 60 * 1000,
+      source,
+    }: { lifetimeMs?: number; source?: 'reminder' } = {},
+  ): Promise<string> {
+    const verificationCode = uuidv4()
+    const hashedVerificationCode = await bcrypt.hash(verificationCode, 10)
+
+    await new this.emailVerificationModel({
+      user: user._id,
+      verificationCode: hashedVerificationCode,
+      expiresAt: new Date(Date.now() + lifetimeMs),
+      ...(source && { source }),
+    }).save()
+
+    return `${process.env.FRONTEND_URL || 'https://textbee.dev'}/verify-email?userId=${user._id}&verificationCode=${verificationCode}`
   }
 
   async verifyEmail({ userId, verificationCode }) {
@@ -526,6 +517,8 @@ export class AuthService {
     this.usersService
       .markMilestone(currentUser._id, 'firstApiKeyAt')
       .catch(() => undefined)
+
+    this.userRollup.refreshQuietly(currentUser._id)
 
     return { apiKey, message: 'Save this key, it wont be shown again ;)' }
   }
@@ -688,6 +681,10 @@ export class AuthService {
     }
     apiKey.revokedAt = new Date()
     await apiKey.save()
+
+    // Only revoking changes the live key count. Deleting one requires it to be
+    // revoked already, so that path cannot move the number.
+    this.userRollup.refreshQuietly(apiKey.user as any)
   }
 
   async renameApiKey(apiKeyId: string, name: string) {

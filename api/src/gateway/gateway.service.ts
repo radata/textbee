@@ -24,6 +24,7 @@ import { WebhookEvent } from '../webhook/webhook-event.enum'
 import { WebhookService } from '../webhook/webhook.service'
 import { BillingService } from '../billing/billing.service'
 import { UsersService } from '../users/users.service'
+import { UserRollupService } from '../users/user-rollup.service'
 import { SmsQueueService } from './queue/sms-queue.service'
 import { escapeRegExp } from '../common/escape-regexp'
 import { normalizeOsFields } from './os-version'
@@ -44,6 +45,11 @@ import {
   toRecoveryPayload,
 } from './pending-recovery'
 import { errorHistoryPush } from './error-history'
+import { resolveSimSelection, resolveSimUsed } from './sim-report'
+import {
+  loadSmsPermissionStatus,
+  reportsSmsPermissionOff,
+} from './sms-permission-status'
 import {
   resolveReportAttempt,
   resolveReportedAt,
@@ -58,6 +64,7 @@ import {
 } from './fcm-send-skip'
 import { DispatchPlan } from './queue/dispatch-pacing'
 import { Job } from 'bull'
+import { SmsBatchStatusService } from './sms-batch-status.service'
 
 // device.user is a ref, so it is an ObjectId unless the query populated it.
 function userIdOf(user: any) {
@@ -77,6 +84,8 @@ export class GatewayService {
     private billingService: BillingService,
     private smsQueueService: SmsQueueService,
     private usersService: UsersService,
+    private readonly userRollup: UserRollupService,
+    private readonly batchStatus: SmsBatchStatusService,
   ) {}
 
   // Blocks creating or re-enabling a device when the user's plan device limit
@@ -203,6 +212,11 @@ export class GatewayService {
       this.usersService
         .markMilestone(user._id, 'firstDeviceAt')
         .catch(() => undefined)
+
+      // Keeps device-based notification targeting current without waiting for
+      // the nightly sweep. Not awaited, like the milestone above, and it never
+      // rejects, so it can neither slow nor fail a registration.
+      this.userRollup.refreshQuietly(user._id)
 
       return createdDevice
     }
@@ -370,11 +384,24 @@ export class GatewayService {
       updateData.fcmTokenUpdatedAt = now
     }
 
-    return await this.deviceModel.findByIdAndUpdate(
+    // Re-registration is the other path that can move the reported build, and
+    // the rollup carries the oldest build on the account, which decides whether
+    // an update prompt is shown.
+    const appVersionChanged =
+      updateData.appVersionCode !== undefined &&
+      updateData.appVersionCode !== device.appVersionCode
+
+    const updated = await this.deviceModel.findByIdAndUpdate(
       deviceId,
       this.tokenUpdate(device, input.fcmToken, updateData),
       { new: true },
     )
+
+    if (appVersionChanged) {
+      this.userRollup.refreshQuietly(device.user as any)
+    }
+
+    return updated
   }
 
   // Mongoose drops undefined keys from $set, so clearing an invalidation
@@ -430,6 +457,8 @@ export class GatewayService {
       }
       throw error
     }
+
+    this.userRollup.refreshQuietly(device.user as any)
 
     return { success: true }
   }
@@ -505,6 +534,20 @@ export class GatewayService {
     )
   }
 
+  private async failUnsentMessages(
+    filter: Record<string, unknown>,
+    errorMessage: string,
+  ): Promise<void> {
+    try {
+      await this.smsModel.updateMany(
+        { ...filter, status: 'pending' } as any,
+        { $set: { status: 'failed', failedAt: new Date(), errorMessage } },
+      )
+    } catch (error) {
+      console.error('failed to mark unsent messages as failed', error)
+    }
+  }
+
   async sendSMS(deviceId: string, smsData: SendSMSInputDTO): Promise<any> {
     const device = await this.deviceModel.findById(deviceId)
 
@@ -562,6 +605,14 @@ export class GatewayService {
     )
 
     // TODO: Implement a queue to send the SMS if recipients are too many
+
+    const warning = reportsSmsPermissionOff(device, new Date())
+      ? {
+          code: 'SMS_PERMISSION_MISSING',
+          message:
+            'The textbee app on this phone last reported the SMS permission as off. The message fails if it is still off.',
+        }
+      : undefined
 
     let smsBatch: SMSBatch
 
@@ -666,18 +717,15 @@ export class GatewayService {
               queuedAt + plan.projectedCompletionMs,
             ).toISOString(),
           }),
+          ...(warning && { warning }),
         }
       } catch (e) {
-        // Update batch status to failed
         await this.smsBatchModel.findByIdAndUpdate(smsBatch._id, {
-          $set: { status: 'failed', error: e.message },
+          $set: { error: e.message },
         })
 
-        // Update all SMS in batch to failed
-        await this.smsModel.updateMany(
-          { smsBatch: smsBatch._id },
-          { $set: { status: 'failed', error: e.message } },
-        )
+        await this.failUnsentMessages({ smsBatch: smsBatch._id }, e.message)
+        await this.batchStatus.refresh([smsBatch._id])
 
         throw new HttpException(
           {
@@ -734,25 +782,19 @@ export class GatewayService {
           .catch(() => undefined)
       }
 
-      this.smsBatchModel
-        .findByIdAndUpdate(smsBatch._id, {
-          $set: { status: 'completed' },
-        })
-        .exec()
-        .catch((e) => {
-          console.error('failed to update sms batch status to completed')
-        })
+      await this.batchStatus.refresh([smsBatch._id])
 
-      return response
+      return warning ? { ...response, warning } : response
     } catch (e) {
-      this.smsBatchModel
-        .findByIdAndUpdate(smsBatch._id, {
-          $set: { status: 'failed', error: e.message },
-        })
+      // Nothing reached the phone, so the messages still pending have failed
+      await this.failUnsentMessages({ smsBatch: smsBatch._id }, e.message)
+      await this.smsBatchModel
+        .findByIdAndUpdate(smsBatch._id, { $set: { error: e.message } })
         .exec()
-        .catch((e) => {
-          console.error('failed to update sms batch status to failed')
+        .catch(() => {
+          console.error('failed to record the sms batch error')
         })
+      await this.batchStatus.refresh([smsBatch._id])
       throw new HttpException(
         {
           success: false,
@@ -1031,21 +1073,12 @@ export class GatewayService {
           }),
         }
       } catch (e) {
-        // Update batch status to failed
         await this.smsBatchModel.findByIdAndUpdate(smsBatch._id, {
-          $set: {
-            status: 'failed',
-            error: e.message,
-            successCount: 0,
-            failureCount: fcmMessagesWithDelays.length,
-          },
+          $set: { error: e.message },
         })
 
-        // Update all SMS in batch to failed
-        await this.smsModel.updateMany(
-          { smsBatch: smsBatch._id },
-          { $set: { status: 'failed', error: e.message } },
-        )
+        await this.failUnsentMessages({ smsBatch: smsBatch._id }, e.message)
+        await this.batchStatus.refresh([smsBatch._id])
 
         throw new HttpException(
           {
@@ -1101,28 +1134,30 @@ export class GatewayService {
             .catch(() => undefined)
         }
 
-        this.smsBatchModel
-          .findByIdAndUpdate(smsBatch._id, {
-            $set: { status: 'completed' },
-          })
-          .exec()
-          .catch((e) => {
-            console.error('failed to update sms batch status to completed')
-          })
       } catch (e) {
         console.log('Failed to send SMS: FCM')
         console.log(e)
 
-        this.smsBatchModel
-          .findByIdAndUpdate(smsBatch._id, {
-            $set: { status: 'failed', error: e.message },
+        const smsIds = batch
+          .map((m) => {
+            try {
+              return JSON.parse(m.data.smsData).smsId
+            } catch {
+              return undefined
+            }
           })
+          .filter(Boolean)
+        await this.failUnsentMessages({ _id: { $in: smsIds } }, e.message)
+        this.smsBatchModel
+          .findByIdAndUpdate(smsBatch._id, { $set: { error: e.message } })
           .exec()
-          .catch((e) => {
-            console.error('failed to update sms batch status to failed')
+          .catch(() => {
+            console.error('failed to record the sms batch error')
           })
       }
     }
+
+    await this.batchStatus.refresh([smsBatch._id])
 
     const successCount = fcmResponses.reduce(
       (acc, m) => acc + m.successCount,
@@ -1219,6 +1254,7 @@ export class GatewayService {
       return existingSMS
     }
 
+    const simUsed = resolveSimUsed(dto.simSubscriptionId, dto.simSlotIndex)
     const sms = await this.smsModel.create({
       user: device.user,
       device: device._id,
@@ -1229,6 +1265,7 @@ export class GatewayService {
       receivedAt,
       ...lateArrivalTimestamps(receivedAt, device.createdAt),
       ...(overLimit && { overLimit: true }),
+      ...(simUsed && { simUsed }),
       metadata: appVersionMetadata(device, sdkClient),
     })
 
@@ -1299,7 +1336,7 @@ export class GatewayService {
       )
       .populate({
         path: 'device',
-        select: '_id brand model buildId enabled',
+        select: '_id name brand model buildId enabled',
       })
       .lean() // Use lean() to return plain JavaScript objects instead of Mongoose documents
 
@@ -1374,7 +1411,7 @@ export class GatewayService {
       })
       .populate({
         path: 'device',
-        select: '_id brand model buildId enabled',
+        select: '_id name brand model buildId enabled',
       })
       .lean() // Use lean() to return plain JavaScript objects instead of Mongoose documents
 
@@ -1490,7 +1527,7 @@ export class GatewayService {
 
       const data = await this.smsModel
         .find(findQuery, null, { sort, limit: limit + 1 })
-        .populate({ path: 'device', select: '_id brand model buildId enabled' })
+        .populate({ path: 'device', select: '_id name brand model buildId enabled' })
         .lean()
 
       const hasMore = data.length > limit
@@ -1513,7 +1550,7 @@ export class GatewayService {
     const total = await this.smsModel.countDocuments(query)
     const data = await this.smsModel
       .find(query, null, { sort, limit, skip })
-      .populate({ path: 'device', select: '_id brand model buildId enabled' })
+      .populate({ path: 'device', select: '_id name brand model buildId enabled' })
       .lean()
 
     // nextCursor here too, so a poller can enter keyset mode from its first
@@ -1614,6 +1651,15 @@ export class GatewayService {
     if (reportAttempt !== undefined) {
       updateData['metadata.statusReportAttempt'] = reportAttempt
     }
+    // Dotted paths so a report with only one part keeps the other
+    const simUsed = resolveSimUsed(dto.simSubscriptionId, dto.simSlotIndex)
+    for (const [key, value] of Object.entries(simUsed ?? {})) {
+      updateData[`simUsed.${key}`] = value
+    }
+    const simSelection = resolveSimSelection(dto.simSelection)
+    if (simSelection) {
+      updateData['metadata.simSelection'] = simSelection
+    }
 
     // Update timestamps based on status
     let failureEntry: { $push: Record<string, any> } | null = null
@@ -1645,29 +1691,9 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
   { new: true } 
 );
     
-    // Check if all SMS in batch have the same status, then update batch status.
-    // The batch id comes from the body, so it is matched against this device.
-    if (dto.smsBatchId && Types.ObjectId.isValid(dto.smsBatchId)) {
-      // SMSBatch types `device` as the populated Device, so the filter is cast
-      // to match the ObjectId actually stored. Runtime behavior is unchanged.
-      const smsBatch = await this.smsBatchModel.findOne({
-        _id: dto.smsBatchId,
-        device: new Types.ObjectId(deviceId),
-      } as any);
-      if (smsBatch) {
-        const allSmsInBatch = await this.smsModel.find({ smsBatch: dto.smsBatchId });
-        
-        // Check if all SMS in batch have the same status (case insensitive)
-        const allHaveSameStatus = allSmsInBatch.every(sms => sms.status.toLowerCase() === normalizedStatus);
-        
-        if (allHaveSameStatus) {
-          const smsBatchStatus = normalizedStatus === 'failed' ? 'failed' : 'completed';
-          await this.smsBatchModel.findByIdAndUpdate(dto.smsBatchId, { 
-            $set: { status: smsBatchStatus } 
-          });
-        }
-      }
-    }
+    // The message was checked against this device, so its own batch is used
+    // rather than the id in the body
+    await this.batchStatus.refresh([sms.smsBatch])
     
     // Trigger webhook event for SMS status update
     try {
@@ -1724,6 +1750,16 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
       totalDeviceCount,
       totalApiKeyCount,
     }
+  }
+
+  async getSmsPermissionStatus(user: User) {
+    return loadSmsPermissionStatus(
+      this.smsModel as any,
+      this.deviceModel,
+      user._id as Types.ObjectId,
+      new Date(),
+      { includeHeartbeat: true },
+    )
   }
 
   private getRecipientsPreview(recipients: string[]): string {
@@ -1845,7 +1881,9 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
     }
 
     const claimed: any[] = []
+    const firstDispatches: any[] = []
     while (claimed.length < CLAIM_LIMIT) {
+      // The pre-claim row, so the push time this overwrites can be kept
       const sms = await this.smsModel.findOneAndUpdate(
         pendingRecoveryFilter(deviceId, now),
         {
@@ -1856,11 +1894,29 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
           },
           $inc: { dispatchAttempts: 1 },
         },
-        { new: true, sort: { requestedAt: 1 } },
+        { new: false, sort: { requestedAt: 1 } },
       )
       if (!sms) break
       claimed.push(toRecoveryPayload(sms))
+      // After a first recovery, dispatchedAt holds a poll time, not a push time
+      if (sms.dispatchedAt && !sms.metadata?.recoveredAt) {
+        firstDispatches.push({
+          updateOne: {
+            filter: { _id: sms._id, 'metadata.firstDispatchedAt': { $exists: false } },
+            update: { $set: { 'metadata.firstDispatchedAt': sms.dispatchedAt } },
+          },
+        })
+      }
     }
+    // Debug data only; the claims are committed, so the phone must still get them
+    if (firstDispatches.length > 0) {
+      try {
+        await this.smsModel.bulkWrite(firstDispatches, { ordered: false })
+      } catch (error) {
+        console.error('failed to record the first dispatch time', error)
+      }
+    }
+    await this.batchStatus.refresh(claimed.map((sms) => sms.smsBatchId))
     return claimed
   }
 
@@ -1950,6 +2006,19 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
     if (input.appVersionCode && device.appVersionCode !== input.appVersionCode) {
       updateData.appVersionCode = input.appVersionCode
     }
+
+    // The app reports an upgrade here and nowhere else, and the rollup carries
+    // the oldest build on the account, which decides whether an update prompt is
+    // shown. Without refreshing on a change, someone who has just updated keeps
+    // being told to update until the nightly sweep. Compared against the same
+    // effective version the rollup stores, so an unchanged heartbeat costs
+    // nothing.
+    const reportedVersion =
+      input.appVersionCode ?? device.appVersionInfo?.versionCode
+    const appVersionChanged =
+      typeof reportedVersion === 'number' &&
+      reportedVersion !==
+        (device.appVersionInfo?.versionCode ?? device.appVersionCode)
 
     // Update OS info if provided. These change at most once per OS upgrade,
     // so skip keys already matching the stored value to keep the write a no-op.
@@ -2058,6 +2127,10 @@ const updatedSms = await this.smsModel.findByIdAndUpdate(
       deviceId,
       this.tokenUpdate(device, input.fcmToken, updateData),
     )
+
+    if (appVersionChanged) {
+      this.userRollup.refreshQuietly(device.user as any)
+    }
 
     // Fetch updated device to get current name
     const updatedDevice = await this.deviceModel.findById(deviceId)

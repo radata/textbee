@@ -19,6 +19,12 @@ export type SmsMessage = {
   errorCode?: string
   errorMessage?: string
   device?: Device
+  // Batch id of the send this message came from.
+  smsBatch?: string
+  // SIM the caller requested, not necessarily the one used.
+  simSubscriptionId?: number
+  // SIM the phone reports it used. Absent from older app versions.
+  simUsed?: { subscriptionId?: number; slotIndex?: number }
 }
 
 export type MessagesPagination = {

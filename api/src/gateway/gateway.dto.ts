@@ -1,12 +1,13 @@
 import { ApiProperty, getSchemaPath } from '@nestjs/swagger'
 import { SMSType } from './sms-type.enum'
+import { SIM_SELECTIONS } from './sim-report'
 
 export class SimInfoDTO {
   @ApiProperty({
     type: Number,
     required: true,
     description:
-      'Android subscription id of the SIM. Pass it as simSubscriptionId when sending to choose this SIM.',
+      'Android subscription id of the SIM. Pass it as simSubscriptionId when sending to choose this SIM. It can change when the SIM is removed and reinserted or swapped.',
     example: 1,
   })
   subscriptionId: number
@@ -313,7 +314,7 @@ export class SMSData {
     type: Number,
     required: false,
     description:
-      'SIM to send from, as subscriptionId from the device simInfo. Defaults to the device default SIM.',
+      'SIM to send from, as subscriptionId from the device simInfo. Defaults to the device default SIM. Android can assign a new id when a SIM is removed and reinserted or swapped, so read the current id from the SIM Cards section of the textbee app before you hard-code it. An id that matches no active SIM is sent from the preferred SIM set in the textbee app, or the device default SIM.',
     example: 1,
   })
   simSubscriptionId?: number
@@ -429,6 +430,23 @@ export class ReceivedSMSDTO {
     example: 1789295400000,
   })
   receivedAtInMillis?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Subscription id of the SIM that received the message.',
+    example: 19,
+  })
+  simSubscriptionId?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      'Zero-based slot of the SIM that received the message: 0 is SIM 1, 1 is SIM 2.',
+    example: 1,
+  })
+  simSlotIndex?: number
 }
 
 // The device summary embedded in message responses. Message queries populate
@@ -442,6 +460,14 @@ export class MessageDeviceDTO {
     description: 'Whether the device may send and receive SMS.',
   })
   enabled: boolean
+
+  @ApiProperty({
+    type: String,
+    required: false,
+    description: 'Your own label for the device.',
+    example: 'Office phone',
+  })
+  name?: string
 
   @ApiProperty({ type: String, description: 'Device brand.', example: 'google' })
   brand: string
@@ -870,6 +896,24 @@ export class DeviceDTO {
   updatedAt: Date
 }
 
+export class SimUsedDTO {
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Subscription id of the SIM.',
+    example: 19,
+  })
+  subscriptionId?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Zero-based slot of the SIM: 0 is SIM 1, 1 is SIM 2.',
+    example: 1,
+  })
+  slotIndex?: number
+}
+
 export class RetrieveSMSDTO {
   @ApiProperty({ type: String, description: 'Message id.' })
   _id: string
@@ -945,9 +989,18 @@ export class RetrieveSMSDTO {
   @ApiProperty({
     type: Number,
     required: false,
-    description: 'SIM the message was sent from.',
+    description:
+      'SIM requested for this send, as passed in the send request. Not necessarily the SIM used: read simUsed for that.',
   })
   simSubscriptionId?: number
+
+  @ApiProperty({
+    type: SimUsedDTO,
+    required: false,
+    description:
+      'SIM the device reports it used: the SIM that sent an outgoing message, or the SIM that received an incoming one. Absent when the device app does not report it.',
+  })
+  simUsed?: SimUsedDTO
 
   @ApiProperty({
     type: Date,
@@ -1257,6 +1310,34 @@ export class UpdateSMSStatusDTO {
   @ApiProperty({
     type: Number,
     required: false,
+    description:
+      'Subscription id of the SIM the device used for this message. Can differ from the requested simSubscriptionId.',
+    example: 19,
+  })
+  simSubscriptionId?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      'Zero-based slot of the SIM the device used for this message: 0 is SIM 1, 1 is SIM 2.',
+    example: 1,
+  })
+  simSlotIndex?: number
+
+  @ApiProperty({
+    type: String,
+    required: false,
+    enum: SIM_SELECTIONS,
+    description:
+      'Why the device used that SIM. requested_invalid_fallback means the requested simSubscriptionId matched no active SIM, so the device fell back to the preferred SIM set in the textbee app, or the device default SIM.',
+    example: 'requested',
+  })
+  simSelection?: string
+
+  @ApiProperty({
+    type: Number,
+    required: false,
     description: 'Which attempt of the device retry loop filed this report',
   })
   reportAttempt?: number
@@ -1528,6 +1609,65 @@ export class GatewayStatsResponseDTO {
   data: GatewayStatsDTO
 }
 
+export class SmsPermissionStatusDTO {
+  @ApiProperty({
+    type: Boolean,
+    nullable: true,
+    description:
+      'True when your latest outgoing message failed because the textbee app on the phone lacks the SMS permission (error code PERMISSION_DENIED) and the phone has not reported the permission granted since, or when an enabled phone reported the SMS permission off in a heartbeat within the last 7 days. False when neither applies. Null when the account has never sent a message and no phone reports the permission off.',
+  })
+  needsSmsPermission: boolean | null
+
+  @ApiProperty({
+    type: Number,
+    nullable: true,
+    description:
+      'Whole hours since that failure. Null unless source is failure.',
+  })
+  hoursSinceFailure: number | null
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Id of the device that reported the failure, or the missing permission in a heartbeat. Null unless needsSmsPermission is true.',
+  })
+  deviceId: string | null
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    description:
+      'Name of that device, or its brand and model when it has no name. Null unless needsSmsPermission is true.',
+  })
+  deviceName: string | null
+
+  @ApiProperty({
+    type: Date,
+    nullable: true,
+    description:
+      'When the server received the failure report from the phone. Null unless source is failure.',
+  })
+  failedAt: Date | null
+
+  @ApiProperty({
+    type: String,
+    nullable: true,
+    enum: ['failure', 'heartbeat'],
+    description:
+      'Why needsSmsPermission is true. failure: your latest outgoing message failed because the permission is missing. heartbeat: the phone reports the permission as off, and no message has failed for it yet. Null unless needsSmsPermission is true.',
+  })
+  source: 'failure' | 'heartbeat' | null
+}
+
+export class SmsPermissionStatusResponseDTO {
+  @ApiProperty({
+    type: SmsPermissionStatusDTO,
+    description: 'Whether a missing SMS permission is blocking your sends.',
+  })
+  data: SmsPermissionStatusDTO
+}
+
 export class DeviceListResponseDTO {
   @ApiProperty({ type: [DeviceDTO], description: 'Your devices.' })
   data: DeviceDTO[]
@@ -1546,6 +1686,24 @@ export class SuccessResultDTO {
 export class SuccessResponseDTO {
   @ApiProperty({ type: SuccessResultDTO, description: 'Outcome of the action.' })
   data: SuccessResultDTO
+}
+
+export class SendSMSWarningDTO {
+  @ApiProperty({
+    type: String,
+    description:
+      'Machine readable warning code. SMS_PERMISSION_MISSING: the textbee app on the sending phone last reported the SMS permission as off. The message is queued, and it fails if the permission is still off.',
+    example: 'SMS_PERMISSION_MISSING',
+  })
+  code: string
+
+  @ApiProperty({
+    type: String,
+    description: 'Human readable explanation of the warning.',
+    example:
+      'The textbee app on this phone last reported the SMS permission as off. The message fails if it is still off.',
+  })
+  message: string
 }
 
 export class SendSMSResultDTO {
@@ -1603,6 +1761,14 @@ export class SendSMSResultDTO {
     description: 'Messages that could not be pushed to the device.',
   })
   failureCount?: number
+
+  @ApiProperty({
+    type: SendSMSWarningDTO,
+    required: false,
+    description:
+      'Present when the message was accepted but is likely to fail, for example because the phone reported the SMS permission off in the last 7 days. Set for single sends only, not for bulk sends.',
+  })
+  warning?: SendSMSWarningDTO
 }
 
 export class SendSMSResponseDTO {
@@ -1647,11 +1813,63 @@ export class SMSBatchDTO {
   })
   recipientPreview?: string
 
-  @ApiProperty({ type: Number, description: 'Messages sent so far.' })
+  @ApiProperty({
+    type: Number,
+    description:
+      'Messages the phone reported as sent or delivered. Equals sentCount plus deliveredCount.',
+    example: 3,
+  })
   successCount: number
 
-  @ApiProperty({ type: Number, description: 'Messages that failed.' })
+  @ApiProperty({
+    type: Number,
+    description:
+      'Messages that failed, either on the phone or before they reached it.',
+    example: 1,
+  })
   failureCount: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Messages not yet handed to the phone. Paced and scheduled messages wait here.',
+    example: 0,
+  })
+  pendingCount?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Messages handed to the phone that have not reported a result yet.',
+    example: 0,
+  })
+  dispatchedCount?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      'Messages the phone sent that have no delivery report yet. A message moves to deliveredCount when its delivery report arrives.',
+    example: 1,
+  })
+  sentCount?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description: 'Messages with a delivery report from the carrier.',
+    example: 2,
+  })
+  deliveredCount?: number
+
+  @ApiProperty({
+    type: Number,
+    required: false,
+    description:
+      'Messages with no result: no report from the phone 20 minutes after they were due, or a state textbee does not recognize. A late report still updates the message and the batch.',
+    example: 0,
+  })
+  unknownCount?: number
 
   @ApiProperty({
     type: String,
@@ -1668,23 +1886,33 @@ export class SMSBatchDTO {
       'delivered',
     ],
     description:
-      'Progress of the batch as a whole, lowercase. Absent on batches stored before status tracking. sent and delivered appear on older batches that mirrored the per-message state.',
+      'Outcome of the batch, calculated from its messages. processing: at least one message is pending or dispatched. completed: every message was sent or delivered. failed: every message failed. partial_success: some were sent or delivered, the rest failed or are unknown. unknown: none was sent and at least one is unknown, or the batch has no messages. pending: the batch was created and no message was queued yet. sent and delivered appear only on old batches that have no messages.',
+    example: 'partial_success',
   })
   status?: string
 
   @ApiProperty({
     type: String,
     required: false,
-    description: 'Failure reason when the batch failed.',
+    description:
+      'Error from the last failed attempt to hand the batch to the phone. It can be present on a batch that later sent some messages.',
   })
   error?: string
 
   @ApiProperty({
     type: Date,
     required: false,
-    description: 'When the batch finished.',
+    description:
+      'When the batch reached its current final status. Absent while the batch is processing.',
   })
   completedAt?: Date
+
+  @ApiProperty({
+    type: Date,
+    required: false,
+    description: 'When the status and counts were last calculated from the messages.',
+  })
+  statusCheckedAt?: Date
 
   @ApiProperty({ type: Date, description: 'When the batch was created.' })
   createdAt: Date

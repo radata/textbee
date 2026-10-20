@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
+import Link from 'next/link'
 import {
   Card,
   CardContent,
@@ -23,13 +24,26 @@ import { Spinner } from '@/components/ui/spinner'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { sendSmsSchema, type SendSmsFormData } from '@/lib/schemas'
-import { AlertCircle, CheckCircle2, MessageSquare, Send } from 'lucide-react'
+import {
+  AlertCircle,
+  BookOpen,
+  CheckCircle2,
+  MessageSquare,
+  Send,
+  ShieldAlert,
+} from 'lucide-react'
 import { formatError } from '@/lib/utils/errorHandler'
 import { RateLimitError } from '@/components/shared/rate-limit-error'
 import { formatDeviceName } from '@/lib/utils'
-import { useDevices, useSendSms } from '@/lib/api'
+import {
+  useDevices,
+  useSendSms,
+  useSmsPermissionFastPoll,
+} from '@/lib/api'
+import { smsPermissionGuideUrl } from '@/config/external-links'
 import { getSegmentInfo } from '@/lib/sms'
 import RecipientInput from './recipient-input'
+import { SimIdInput } from '../sim-id-input'
 
 export default function SendSms() {
   // Typed hook rather than a raw useQuery(['devices']) reading devices.data:
@@ -43,12 +57,17 @@ export default function SendSms() {
     isSuccess,
     reset: resetSend,
   } = useSendSms()
+  const { start: startFastPoll, sendFailedForPermission } =
+    useSmsPermissionFastPoll()
+  // Kept so "Send again" can resubmit after the form resets.
+  const [lastSent, setLastSent] = useState<SendSmsFormData | null>(null)
 
   const {
     control,
     register,
     handleSubmit,
     setValue,
+    clearErrors,
     reset,
     formState: { errors },
   } = useForm<SendSmsFormData>({
@@ -79,23 +98,26 @@ export default function SendSms() {
   }, [selectedDeviceId, preselectedDeviceId, setValue])
 
   const selectedDevice = devices?.find((d) => d._id === selectedDeviceId)
-  const availableSims = Array.isArray((selectedDevice as any)?.simInfo?.sims)
-    ? (selectedDevice as any).simInfo.sims
-    : []
 
   const segments = getSegmentInfo(message)
 
-  const onSubmit = (data: SendSmsFormData) =>
+  const onSubmit = (data: SendSmsFormData) => {
+    // Before the send, so the baseline is the state the send starts from.
+    startFastPoll()
     sendSms(data, {
       onSuccess: () => {
-        // Reset so the next message starts clean, keeping the chosen device.
+        setLastSent(data)
+        // Reset so the next message starts clean, keeping the chosen device
+        // and SIM: dropping the SIM would send the next one from the default.
         reset({
           deviceId: data.deviceId,
+          simSubscriptionId: data.simSubscriptionId,
           recipients: [],
           message: '',
         })
       },
     })
+  }
 
   return (
     <Card>
@@ -117,7 +139,15 @@ export default function SendSms() {
               name='deviceId'
               control={control}
               render={({ field }) => (
-                <Select onValueChange={field.onChange} value={field.value ?? ''}>
+                <Select
+                  onValueChange={(value) => {
+                    field.onChange(value)
+                    // A subscription ID belongs to one phone
+                    setValue('simSubscriptionId', undefined)
+                    clearErrors('simSubscriptionId')
+                  }}
+                  value={field.value ?? ''}
+                >
                   <SelectTrigger id='sms-device'>
                     <SelectValue
                       placeholder={
@@ -151,34 +181,24 @@ export default function SendSms() {
             )}
           </div>
 
-          {availableSims.length > 1 && (
-            <div className='space-y-1.5'>
-              <Label htmlFor='sms-sim'>SIM (optional)</Label>
-              <Controller
-                name='simSubscriptionId'
-                control={control}
-                render={({ field }) => (
-                  <Select
-                    onValueChange={(value) => field.onChange(Number(value))}
-                    value={field.value?.toString() ?? ''}
-                  >
-                    <SelectTrigger id='sms-sim'>
-                      <SelectValue placeholder='Default SIM' />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {availableSims.map((sim: any) => (
-                        <SelectItem
-                          key={sim.subscriptionId}
-                          value={String(sim.subscriptionId)}
-                        >
-                          {sim.displayName || 'SIM'} ({sim.subscriptionId})
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
-              />
-            </div>
+          {/* On the device ID, not the device, so a set value never hides
+              if the device drops out of a refetch */}
+          {selectedDeviceId && (
+            <Controller
+              name='simSubscriptionId'
+              control={control}
+              render={({ field }) => (
+                <SimIdInput
+                  key={selectedDeviceId}
+                  ref={field.ref}
+                  id='sms-sim'
+                  value={field.value}
+                  onChange={field.onChange}
+                  simInfo={(selectedDevice as any)?.simInfo}
+                  error={errors.simSubscriptionId?.message}
+                />
+              )}
+            />
           )}
 
           <Controller
@@ -213,7 +233,7 @@ export default function SendSms() {
                 {segments.segments === 1 ? '' : 's'} ({segments.encoding})
               </span>
               {segments.segments > 1 && (
-                <span className='text-amber-600 dark:text-amber-500'>
+                <span className='text-warning'>
                   Over {segments.perSegment} characters counts as multiple
                   messages
                 </span>
@@ -246,7 +266,7 @@ export default function SendSms() {
               )
             })()}
 
-          {isSuccess && (
+          {isSuccess && !sendFailedForPermission && (
             <Alert>
               <CheckCircle2 className='h-4 w-4' />
               <AlertTitle>Message sent</AlertTitle>
@@ -283,6 +303,51 @@ export default function SendSms() {
             )}
           </Button>
         </form>
+
+        {sendFailedForPermission && !isSendingSms && (
+          <Alert variant='destructive' className='mt-5'>
+            <ShieldAlert className='h-4 w-4' />
+            <AlertTitle>
+              This message failed: the textbee app on your phone does not have
+              the SMS permission.
+            </AlertTitle>
+            <AlertDescription>
+              <ol className='mt-2 list-decimal space-y-1 pl-4'>
+                <li>
+                  On the phone open Settings &gt; Apps &gt; textbee &gt;
+                  Permissions.
+                </li>
+                <li>
+                  On Android 15 and newer, tap the menu (⋮) and choose Allow
+                  restricted settings.
+                </li>
+                <li>Set SMS to Allow.</li>
+              </ol>
+              <div className='mt-3 flex flex-wrap gap-2'>
+                <Button variant='default' size='sm' asChild>
+                  <Link
+                    href={smsPermissionGuideUrl('send_form')}
+                    target='_blank'
+                    rel='noopener noreferrer'
+                  >
+                    <BookOpen className='h-4 w-4' />
+                    Show me how
+                  </Link>
+                </Button>
+                <Button
+                  type='button'
+                  variant='outline'
+                  size='sm'
+                  disabled={!lastSent}
+                  onClick={() => lastSent && onSubmit(lastSent)}
+                >
+                  <Send className='h-4 w-4' />
+                  Send again
+                </Button>
+              </div>
+            </AlertDescription>
+          </Alert>
+        )}
       </CardContent>
     </Card>
   )

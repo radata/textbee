@@ -1,5 +1,15 @@
-import { Controller, Post, Body, Get, UseGuards, Request } from '@nestjs/common'
-import { BillingService } from './billing.service'
+import {
+  Controller,
+  Post,
+  Body,
+  Get,
+  UseGuards,
+  Request,
+  Query,
+  Res,
+} from '@nestjs/common'
+import { Response } from 'express'
+import { BillingService, PolarSubscriptionSync, toDate } from './billing.service'
 import { AuthGuard } from 'src/auth/guards/auth.guard'
 import {
   ApiTags,
@@ -145,6 +155,23 @@ export class BillingController {
     })
   }
 
+  // Signed links from billing emails, reached through the web app.
+  @ApiExcludeEndpoint()
+  @Get('card')
+  async cardUpdate(@Query('t') t: string, @Res() res: Response) {
+    const url = await this.billingService.cardUpdateRedirect(t)
+    res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' })
+    return res.redirect(302, url)
+  }
+
+  @ApiExcludeEndpoint()
+  @Get('checkout/resume')
+  async checkoutResume(@Query('t') t: string, @Res() res: Response) {
+    const url = await this.billingService.checkoutResumeRedirect(t)
+    res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' })
+    return res.redirect(302, url)
+  }
+
   // Provider to server callback with a signed raw body, not something a
   // developer calls, so it stays out of the docs.
   @ApiExcludeEndpoint()
@@ -154,33 +181,61 @@ export class BillingController {
       data,
       req.headers,
     )
+    if (!payload) return
 
     // store the payload in the database
     await this.billingService.storePolarWebhookPayload(payload)
+
+    const eventAt = new Date((payload as any).timestamp ?? Date.now())
+    const event: any = payload.data
+    const pastDue = () =>
+      this.billingService.syncPastDue({
+        polarSubscriptionId: event?.id,
+        status: event?.status,
+        pastDueAt: event?.past_due_at,
+        eventAt: event?.modified_at ? new Date(event.modified_at) : eventAt,
+      })
+
+    // Every subscription event carries the full subscription, so each one is
+    // applied the same way; switchPlan decides whether it is still current.
+    const sync = (extra: Partial<PolarSubscriptionSync> = {}) =>
+      this.billingService.switchPlan({
+        userId: (event?.metadata?.userId ||
+          event?.customer?.external_id) as string,
+        newPlanPolarProductId: event?.product?.id ?? event?.product_id,
+        currentPeriodStart: toDate(event?.current_period_start),
+        currentPeriodEnd: toDate(event?.current_period_end),
+        status: event?.status,
+        subscriptionStartDate: toDate(event?.started_at ?? event?.created_at),
+        endsAt: toDate(event?.ends_at),
+        endedAt: toDate(event?.ended_at),
+        // Polar's own change time; the delivery time when a payload lacks it.
+        modifiedAt:
+          toDate(event?.modified_at) ??
+          ((payload as any).timestamp ? new Date((payload as any).timestamp) : undefined),
+        amount: event?.amount,
+        currency: event?.currency,
+        recurringInterval: event?.recurring_interval,
+        polarSubscriptionId: event?.id,
+        polarCustomerId: event?.customer_id,
+        cancelAtPeriodEnd: event?.cancel_at_period_end,
+        ...extra,
+      })
 
     // Handle Polar.sh webhook events
     switch (payload.type) {
       case 'subscription.created':
       case 'subscription.active':
       case 'subscription.updated':
+      case 'subscription.uncanceled':
         console.log('polar webhook event', payload.type)
         console.log(payload)
-        await this.billingService.switchPlan({
-          userId: (payload.data?.metadata?.userId ||
-            payload.data?.customer?.externalId) as string,
-          newPlanPolarProductId: payload.data?.product?.id,
-          currentPeriodStart: payload.data?.currentPeriodStart,
-          currentPeriodEnd: payload.data?.currentPeriodEnd,
-          status: payload.data?.status,
-          subscriptionStartDate: payload.data?.createdAt,
-          subscriptionEndDate: payload.data?.canceledAt,
-          amount: payload.data?.amount,
-          currency: payload.data?.currency,
-          recurringInterval: payload.data?.recurringInterval,
-          polarSubscriptionId: payload.data?.id,
-          polarCustomerId: payload.data?.customerId,
-          cancelAtPeriodEnd: payload.data?.cancelAtPeriodEnd,
-        })
+        await sync()
+        await pastDue()
+        break
+
+      case 'subscription.past_due':
+        await pastDue()
         break
 
       // @ts-ignore
@@ -189,16 +244,19 @@ export class BillingController {
       case 'subscription.canceled':
         console.log('polar webhook event', payload.type)
         console.log(payload)
-        // Cancellation is SCHEDULED here: access continues until period end.
-        // Record the intent without downgrading; the actual downgrade happens
-        // on "subscription.revoked".
-        await this.billingService.cancelSubscription({
-          userId: (payload.data?.metadata?.userId ||
-            payload.data?.customer?.externalId) as string,
-          polarProductId: payload.data?.product?.id,
-          cancelAtPeriodEnd: payload.data?.cancelAtPeriodEnd,
-          currentPeriodEnd: payload.data?.currentPeriodEnd,
-          status: payload.data?.status,
+        // Usually a cancellation scheduled for the period end, which keeps
+        // access; an immediate one carries an ended status and ends it here.
+        const applied = await sync()
+        if (applied?.ignored) break
+        await this.billingService.recordChurnCause({
+          polarSubscriptionId: event?.id,
+          churnCause: await this.billingService.churnCause({
+            polarSubscriptionId: event?.id,
+            status: event?.status,
+            cancelAtPeriodEnd: event?.cancel_at_period_end,
+            endsAt: event?.ends_at ?? event?.ended_at,
+            eventAt,
+          }),
         })
         break
 
@@ -206,20 +264,16 @@ export class BillingController {
       case 'subscription.revoked':
         console.log('polar webhook event', payload.type)
         console.log(payload)
-        // Access should actually end now, so perform the real downgrade.
-        await this.billingService.revokeSubscription({
-          userId: (payload.data?.metadata?.userId ||
-            payload.data?.customer?.externalId) as string,
-          polarProductId: payload.data?.product?.id,
-        })
+        // Access ends now, whatever status the payload carries.
+        await sync({ revoked: true })
         break
 
       case 'checkout.updated':
         // Polar already sends these; they were being dropped here, which is
         // why isCompleted was never written.
         await this.billingService.syncCheckoutSessionStatus({
-          checkoutSessionId: payload.data?.id,
-          status: payload.data?.status,
+          checkoutSessionId: event?.id,
+          status: event?.status,
         })
         break
 
